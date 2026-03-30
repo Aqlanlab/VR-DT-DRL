@@ -1,0 +1,28 @@
+robot:
+  model: 'UR3e'
+  dof: 6
+  joint_names: ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 
+                'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+  
+  # Joint limits in radians
+  joint_limits:
+    shoulder_pan_joint: [-3.14159, 3.14159]
+    shoulder_lift_joint: [-3.14159, 3.14159] 
+    elbow_joint: [-3.14159, 3.14159]
+    wrist_1_joint: [-3.14159, 3.14159]
+    wrist_2_joint: [-3.14159, 3.14159]
+    wrist_3_joint: [-3.14159, 3.14159]
+    
+  performance:
+    max_joint_velocity: 3.14159  # rad/s
+    max_joint_acceleration: 1.57  # rad/s^2
+    
+  workspace:
+    # Workspace bounds (min_xyz, max_xyz) in meters
+    min_bounds: [-0.8, -0.8, 0.0]
+    max_bounds: [0.8, 0.8, 1.2]
+    
+  gripper:
+    type: 'KukaGripper'
+    max_opening: 0.085  # meters
+    force_limit: 100.0  # Newtons

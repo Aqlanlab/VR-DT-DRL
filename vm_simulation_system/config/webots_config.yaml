@@ -1,0 +1,9 @@
+webots:
+  world_file: "Environmentnewww.wbt"  # <--- UPDATED NAME
+  timestep: 32
+  physics_timestep: 16
+  supervisor_name: "supervisor"
+  camera_name: "camera"
+  blocks:
+    count: 5
+    prefix: "block"

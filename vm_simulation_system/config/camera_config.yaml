@@ -1,0 +1,11 @@
+camera:
+  width: 640
+  height: 480
+  fov: 1.047  # 60 degrees field of view
+  fps: 30
+  near_plane: 0.05
+  far_plane: 3.0
+  topics:
+    rgb: "/camera/rgb/image_raw"
+    depth: "/camera/depth/image_raw"
+    info: "/camera/camera_info"
