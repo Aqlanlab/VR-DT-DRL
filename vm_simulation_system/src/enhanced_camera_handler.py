@@ -3,7 +3,7 @@
 Enhanced Camera Handler for UR3 System.
 
 Integrates RGB-D camera processing with ROS and Webots simulation.
-Supports multiple camera types and processing modes, with graceful 
+Supports multiple camera types and processing modes, with 
 fallbacks when hardware or ROS is unavailable.
 """
 
