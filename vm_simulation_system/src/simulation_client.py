@@ -2,7 +2,7 @@
 """
 VM Simulation Client for UR3e System
 
-This module handles the simulation and real-world execution of a UR3 robotic arm.
+This module handles the simulation and real-world execution of a UR3e robotic arm.
 It manages network communications, state tracking, domain randomization, and an
 automated curriculum for reinforcement learning.
 """
