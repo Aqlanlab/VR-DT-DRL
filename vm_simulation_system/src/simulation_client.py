@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-VM Simulation Client for UR3 System.
+VM Simulation Client for UR3e System
 
-Handles communication between the GPU Inference server, the simulated Webots environment,
-and real hardware when configured. Manages training episodes, the curriculum progression,
-and domain randomization.
+This module handles the simulation and real-world execution of a UR3 robotic arm.
+It manages network communications, state tracking, domain randomization, and an
+automated curriculum for reinforcement learning.
 """
 
 import socket
@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque
 
+# RealSense dependencies (--real mode only)
 try:
     import pyrealsense2 as rs
     REALSENSE_AVAILABLE = True
 except ImportError:
     REALSENSE_AVAILABLE = False
 
+# Robotiq gripper dependencies (--real mode only)
 try:
     import roslib; roslib.load_manifest('robotiq_2f_gripper_control')
     from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_output as RobotiqOutput
@@ -36,6 +38,7 @@ try:
 except Exception:
     ROBOTIQ_AVAILABLE = False
 
+# Actionlib for real robot joint trajectory (--real mode only)
 try:
     import actionlib
     from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
@@ -44,6 +47,7 @@ try:
 except ImportError:
     ACTIONLIB_AVAILABLE = False
 
+# ROS imports
 try:
     import rospy
     from sensor_msgs.msg import Image, JointState
@@ -54,6 +58,7 @@ try:
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
+    print("ROS not available, using simulation mode")
     class CvBridge: pass
     class Image: pass
     class JointState: pass
@@ -67,51 +72,73 @@ except ImportError:
         def loginfo(self, msg): print(f"[INFO] {msg}")
         def logwarn(self, msg): print(f"[WARN] {msg}")
         def logerr(self, msg): print(f"[ERROR] {msg}")
+        def logwarn_throttle(self, period, msg): print(f"[WARN] {msg}")
+        def loginfo_throttle(self, period, msg): print(f"[INFO] {msg}")
         def is_shutdown(self): return False
-        def Rate(self, hz): return self
-        def sleep(self): time.sleep(0.1)
+        def Rate(self, hz):
+            class MockRate:
+                def sleep(self): time.sleep(0.1)
+            return MockRate()
+        def sleep(self, secs=0.1): time.sleep(secs)
         def Subscriber(self, *args, **kwargs): pass
         def Publisher(self, *args, **kwargs):
             class MockPub:
                 def publish(self, *args): pass
             return MockPub()
+        class Duration:
+            def __init__(self, secs=0): self.secs = secs
         class ROSInterruptException(Exception): pass
     if 'rospy' not in locals():
         rospy = MockRospy()
 
-from enhanced_robot_controller import create_robot_system
+from enhanced_robot_controller import create_robot_system, create_dual_robot_system
 from enhanced_camera_handler import EnhancedCameraHandler
 from webots_bridge import WebotsBridge
 
 
 class CurriculumManager:
     """
-    Performance-gated training curriculum manager. 
-    Advances simulation difficulty based on successful grasps by the model.
+    Performance-gated curriculum manager.
+    
+    Each phase advancement requires:
+      1. A minimum number of episodes completed in the current phase.
+      2. A minimum AI-only success rate over the last N AI episodes.
+    Teacher (explore) results do not count toward phase advancement.
     """
 
-    PLATFORM_CENTER_X  = -0.67
-    PLATFORM_CENTER_Z  = 0.85065
-    PLATFORM_HALF_SIZE_X = 0.1475   
-    PLATFORM_HALF_SIZE_Z = 0.0925  
+    PLATFORM_CENTER_X  = -0.646
+    PLATFORM_CENTER_Z  = 0.846
+    PLATFORM_HALF_SIZE_X = 0.145 
+    PLATFORM_HALF_SIZE_Z = 0.09  
 
+    # =========================================================================
+    # CURRICULUM PHASE CONFIGURATION
+    # =========================================================================
+    # Tuple format: 
+    # (r_min, r_max, min_episodes_in_phase, mastery_threshold, ai_window)
+    #
+    # Dimensions: 0.30m (X) x 0.23m (Z) -> Half-sizes: 0.15m x 0.115m
+    # Max usable radius before Z edge = 0.115m
+    # =========================================================================
     PHASE_CONFIG = [
-        (0.000, 0.000,  60,  0.85, 20),
-        (0.005, 0.015, 200,  0.75, 40),
-        (0.015, 0.035, 250,  0.65, 50),
-        (0.035, 0.070, 300,  0.55, 50),
-        (0.070, 0.115, 9999, 0.00, 50),
+        (0.000, 0.000,  60,  0.85, 20),  # Phase 0: Static center
+        (0.005, 0.015, 200,  0.75, 40),  # Phase 1: ±0.5cm - 1.5cm
+        (0.015, 0.035, 250,  0.65, 50),  # Phase 2: ±1.5cm - 3.5cm
+        (0.035, 0.070, 300,  0.55, 50),  # Phase 3: ±3.5cm - 7.0cm
+        (0.070, 0.115, 9999, 0.00, 50),  # Phase 4: Full platform
     ]
 
     def __init__(self, state_file="config/curriculum_state.json"):
         self.state_file = Path(state_file)
-        self.phase = 4
+        self.phase             = 4
         self.episodes_in_phase = 0
-        self.episode = 0
+        self.episode           = 0
         self.ai_recent_results = deque(maxlen=50)
+        
         self._load_state()
 
     def _load_state(self):
+        """Restores curriculum state from disk."""
         if self.state_file.exists():
             try:
                 import json
@@ -124,11 +151,12 @@ class CurriculumManager:
                 
                 ai_window = self.PHASE_CONFIG[self.phase][4]
                 self.ai_recent_results = deque(state.get('ai_recent_results', []), maxlen=ai_window)
-                print(f"[CURRICULUM] Resumed from Phase {self.phase}, Episode {self.episode}")
+                print(f"[CURRICULUM] 🔄 Resumed from Phase {self.phase}, Episode {self.episode}")
             except Exception as e:
-                print(f"[CURRICULUM] Could not load state: {e}")
+                print(f"[CURRICULUM] ⚠️ Could not load state: {e}")
 
     def _save_state(self):
+        """Persists current curriculum state to disk."""
         try:
             import json
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -143,11 +171,15 @@ class CurriculumManager:
             pass
 
     def record_result(self, success: bool, mode: str):
-        """Records AI outcomes for evaluating phase advancement."""
+        """
+        Records the outcome of a completed episode.
+        Only 'exploit' (AI) mode results trigger potential phase advancements.
+        """
         self.episodes_in_phase += 1
         if mode == 'exploit':
             self.ai_recent_results.append(success)
-        self._save_state()
+            
+        self._save_state() 
 
     def update(self, episode: int):
         self.episode = episode
@@ -159,11 +191,17 @@ class CurriculumManager:
         return sum(self.ai_recent_results) / len(self.ai_recent_results)
 
     def check_phase_advance(self) -> bool:
-        """Determines if the success rate threshold is met to advance difficulty."""
+        """
+        Evaluates conditions for phase progression.
+        Requires a minimum sample size (20 AI attempts) to prevent 
+        premature advancement from statistical anomalies.
+        """
         if self.phase >= len(self.PHASE_CONFIG) - 1:
             return False
 
         r_min, r_max, min_eps, threshold, ai_window = self.PHASE_CONFIG[self.phase]
+
+        # Resize the tracking window to match the current phase constraints
         self.ai_recent_results = deque(self.ai_recent_results, maxlen=ai_window)
 
         enough_episodes = self.episodes_in_phase >= min_eps
@@ -172,15 +210,15 @@ class CurriculumManager:
         ai_mastered     = ai_attempts >= 20 and ai_rate >= threshold
 
         if enough_episodes and ai_mastered:
-            old_phase = self.phase
+            old_phase   = self.phase
             self.phase += 1
             self.episodes_in_phase = 0
             self.ai_recent_results.clear()
 
             r_new_min, r_new_max, _, new_threshold, new_window = self.PHASE_CONFIG[self.phase]
-            print(f"[CURRICULUM] Phase {old_phase} -> {self.phase} | "
+            print(f"[CURRICULUM] ✅ Phase {old_phase} → {self.phase} | "
                   f"AI mastery: {ai_rate*100:.1f}% over {ai_attempts} attempts")
-            print(f"[CURRICULUM] New radius: {r_new_min*100:.1f}-{r_new_max*100:.1f}cm | "
+            print(f"[CURRICULUM] New radius: {r_new_min*100:.1f}–{r_new_max*100:.1f}cm | "
                   f"Next target: {new_threshold*100:.0f}% over {new_window} AI attempts")
             return True
         return False
@@ -190,17 +228,22 @@ class CurriculumManager:
         return r_min, r_max
 
     def get_spawn_position(self) -> tuple:
+        """Determines the next object spawn position based on the current phase."""
         r_min, r_max = self.get_spawn_radius()
 
         cx = self.PLATFORM_CENTER_X
         cz = self.PLATFORM_CENTER_Z
-        half_x = 0.1475   
-        half_z = 0.0925  
+        
+        half_x = 0.145   
+        half_z = 0.09  
 
         if self.phase == 4:
+            # Full platform random distribution
             spawn_x = np.random.uniform(cx - half_x, cx + half_x)
             spawn_z = np.random.uniform(cz - half_z, cz + half_z)
+            
         else:
+            # Controlled radius expansion for early phases
             if r_max < 0.001:
                 spawn_x, spawn_z = cx, cz
             else:
@@ -213,11 +256,11 @@ class CurriculumManager:
                         spawn_x, spawn_z = sample_x, sample_z
                         break
 
-        ai_rate = self.get_ai_success_rate()
-        ai_window = self.PHASE_CONFIG[self.phase][4]
+        ai_rate    = self.get_ai_success_rate()
+        ai_window  = self.PHASE_CONFIG[self.phase][4]
         print(f"[CURRICULUM] Episode {self.episode} | Phase {self.phase} | "
               f"Spawn: ({spawn_x:.3f}, {spawn_z:.3f}) | "
-              f"AI rate: {ai_rate*100:.1f}% ({len(self.ai_recent_results)}/{ai_window} attempts)")
+              f"AI rate: {ai_rate*100:.1f}% ({len(self.ai_recent_results)}/{ai_window} AI attempts)")
 
         return (spawn_x, None, spawn_z)
 
@@ -225,70 +268,274 @@ class CurriculumManager:
         return self.phase
 
 
+class CurriculumManagerRobot2(CurriculumManager):
+    """
+    Curriculum manager for Robot 2 (ur3_robot2).
+
+    Handles the unique geometric constraints of Platform 2, which features a 
+    curved rear edge. Ensures objects do not spawn in unreachable areas.
+    """
+
+    # World-frame origin of the crossSection (0,0) corner
+    PLATFORM_ORIGIN_X = -1.215
+    PLATFORM_ORIGIN_Z =  0.755
+    SPAWN_Y = 0.461
+
+    # Arc boundary definitions
+    _ARC_CX      =  0.0241   
+    _ARC_CZ      = -0.2965   
+    _ARC_R       =  0.4871   
+    _ARC_R_INSET = 0.4771   
+
+    # Operational boundaries with safety buffer
+    PLATFORM_WORLD_X_MIN = PLATFORM_ORIGIN_X - 0.290  
+    PLATFORM_WORLD_X_MAX = PLATFORM_ORIGIN_X - 0.010 
+    PLATFORM_WORLD_Z_MIN = PLATFORM_ORIGIN_Z + 0.010
+    PLATFORM_WORLD_Z_MAX = PLATFORM_ORIGIN_Z + 0.180  
+
+    PLATFORM_CENTER_X = (PLATFORM_WORLD_X_MIN + PLATFORM_WORLD_X_MAX) / 2
+    PLATFORM_CENTER_Z = (PLATFORM_WORLD_Z_MIN + PLATFORM_WORLD_Z_MAX) / 2
+
+
+    def __init__(self, state_file="config/curriculum_state_robot2.json"):
+        super().__init__(state_file=state_file)
+
+    def _world_to_local(self, wx, wz):
+        """Converts world coordinates to local cross-section coordinates."""
+        local_x = self.PLATFORM_ORIGIN_X - wx
+        local_z = wz - self.PLATFORM_ORIGIN_Z
+        return local_x, local_z
+
+    def _in_spawn_area(self, wx, wz):
+        """Validates if a world point is inside the boundary."""
+        lx, lz = self._world_to_local(wx, wz)
+        dist = np.sqrt((lx - self._ARC_CX)**2 + (lz - self._ARC_CZ)**2)
+        return dist <= self._ARC_R_INSET
+
+    def get_spawn_position(self) -> tuple:
+        """Samples a safe spawn position inside the curved platform area."""
+        r_min, r_max, _, _, _ = self.PHASE_CONFIG[self.phase]
+        cx = self.PLATFORM_CENTER_X
+        cz = self.PLATFORM_CENTER_Z
+
+        MAX_ATTEMPTS = 200
+
+        if self.phase == 4:
+            wx_min, wx_max = self.PLATFORM_WORLD_X_MIN, self.PLATFORM_WORLD_X_MAX
+            wz_min, wz_max = self.PLATFORM_WORLD_Z_MIN, self.PLATFORM_WORLD_Z_MAX
+            
+            for _ in range(MAX_ATTEMPTS):
+                spawn_x = np.random.uniform(wx_min, wx_max)
+                spawn_z = np.random.uniform(wz_min, wz_max)
+                if self._in_spawn_area(spawn_x, spawn_z):
+                    break
+            else:
+                spawn_x, spawn_z = cx, cz  
+
+        elif r_max < 0.001:
+            spawn_x, spawn_z = cx, cz
+
+        else:
+            for _ in range(MAX_ATTEMPTS):
+                sample_x = np.random.uniform(cx - r_max, cx + r_max)
+                sample_z = np.random.uniform(cz - r_max, cz + r_max)
+                dist = np.sqrt((sample_x - cx)**2 + (sample_z - cz)**2)
+                if r_min <= dist <= r_max and self._in_spawn_area(sample_x, sample_z):
+                    spawn_x, spawn_z = sample_x, sample_z
+                    break
+            else:
+                spawn_x, spawn_z = cx, cz 
+
+        ai_rate   = self.get_ai_success_rate()
+        ai_window = self.PHASE_CONFIG[self.phase][4]
+        print(f"[CURRICULUM R2] Episode {self.episode} | Phase {self.phase} | "
+              f"Spawn: ({spawn_x:.3f}, {spawn_z:.3f}) | "
+              f"AI rate: {ai_rate*100:.1f}% ({len(self.ai_recent_results)}/{ai_window} AI attempts)")
+
+        return (spawn_x, None, spawn_z)
+
+
 class SimulationClient:
-    """Main client coordinating data transfer between simulation/hardware and server."""
+    """Main execution client coordinating the physical/simulated robot and neural network."""
 
     def __init__(self, config_path: str = "config/network_config.yaml",
-                 mode: str = 'inference', real_robot: bool = False):
-        self.mode = mode
+                 mode: str = 'inference', real_robot: bool = False,
+                 robot_id: int = 1, ros_camera: bool = False):
+        
+        self.mode       = mode
         self.real_robot = real_robot
-        self.config = self._load_config(config_path)
+        self.robot_id   = robot_id   
+        self.ros_camera = ros_camera 
+        self.config     = self._load_config(config_path)
 
         if ROS_AVAILABLE:
             rospy.init_node('ur3_simulation_client', anonymous=True)
-            rospy.loginfo(f"UR3 Client started (Mode: {mode}, Real robot: {real_robot})")
+            rospy.loginfo(f"UR3 Client started (Mode: {mode}, Real robot: {real_robot}, "
+                          f"Robot ID: {robot_id})")
 
-        self.host_socket = None
-        self.connected = False
-        self.connection_lock = threading.Lock()
-        self.bridge = CvBridge() if ROS_AVAILABLE else None
+        self.host_socket        = None
+        self.connected          = False
+        self.connection_lock    = threading.Lock()
+        self.bridge             = CvBridge() if ROS_AVAILABLE else None
         
-        self.latest_rgb_image = None
+        self.latest_rgb_image   = None
         self.latest_depth_image = None
-        self.latest_rgb_b64 = None
-        self.latest_depth_b64 = None
+        self.latest_rgb_b64     = None
+        self.latest_depth_b64   = None
         self.latest_joint_states = {'names': [], 'positions': [0]*6}
-        
-        self.curriculum = CurriculumManager()
-        self.episode_count = self.curriculum.episode
-        self.episode_active = False
-        self.last_grasp_mode = 'explore'
 
-        self.inference_mode = 'normal'
-        self.cycle_episodes_per_phase = 10   
-        self.fixed_phase = 0    
-        self._cycle_phase = 0    
-        self._cycle_count_in_phase = 0    
-        self._nan_reset_pending = False  
+        self.curriculum = CurriculumManagerRobot2() if robot_id == 2 else CurriculumManager()
+
+        self.episode_count        = self.curriculum.episode
+        self.episode_active       = False
+        self.last_grasp_mode      = 'explore'
+        self._nan_reset_pending   = False
+
+        # Inference sub-mode parameters
+        self.inference_mode           = 'normal'
+        self.cycle_episodes_per_phase = 10
+        self.fixed_phase              = 0
+        self._cycle_phase             = 0
+        self._cycle_count_in_phase    = 0
 
         if real_robot:
             self.webots_bridge = None
-            self._init_realsense()
+            if ros_camera:
+                self._init_ros_camera()
+            else:
+                self._init_realsense()
             self._init_real_robot_motion()
             self._init_robotiq_gripper()
         else:
+            # Setup Webots Simulation Bridge
             self.webots_bridge = WebotsBridge(simulation=False)
 
             self.robot_controller, self.gripper_controller, self.motion_planner = \
                 create_robot_system(
                     config_path="config/robot_config.yaml",
                     simulation=True,
-                    webots_bridge=self.webots_bridge
+                    webots_bridge=self.webots_bridge,
+                    robot_id=robot_id
                 )
 
+            cam_name = 'camera2' if robot_id == 2 else 'robot1'
             self.camera_handler = EnhancedCameraHandler(
                 config_path="config/camera_config.yaml",
                 simulation=True,
                 camera_type="simulation",
-                webots_bridge=self.webots_bridge
+                webots_bridge=self.webots_bridge,
+                camera_name=cam_name
             )
 
             if ROS_AVAILABLE:
                 self._setup_ros_interface()
 
+            self._cam_base = {}
+
+    def _cache_camera_base_poses(self):
+        """
+        Caches the initial camera poses. 
+        This ensures perturbations are relative to the original setup, avoiding drift.
+        """
+        robot = self.webots_bridge.shared_robot
+        if robot is None:
+            self._cam_base = {}
+            return
+
+        groups = {
+            1: ["realsense_color",  "realsense_range"],
+            2: ["realsense_color2", "realsense_range2"],
+        }
+        self._cam_base = {}
+        for rid, defs in groups.items():
+            entries = []
+            ok = True
+            for def_name in defs:
+                node = robot.getFromDef(def_name)
+                if node is None:
+                    print(f"[CAM CACHE] DEF '{def_name}' not found. Disabling camera noise for robot {rid}")
+                    ok = False
+                    break
+                base_rot   = list(node.getField('rotation').getSFRotation())
+                base_trans = list(node.getField('translation').getSFVec3f())
+                entries.append((def_name, node, base_trans, base_rot))
+            if ok:
+                self._cam_base[rid] = entries
+                print(f"[CAM CACHE] Robot {rid} poses cached: {defs}")
+
+    def _randomize_camera_poses(self):
+        """
+        Applies a randomized spatial offset (translation and rotation) to the robot's cameras 
+        each episode to improve model robustness. Applies identically across RGB/Depth pairs.
+        """
+        from scipy.spatial.transform import Rotation as Rot
+
+        entries = getattr(self, '_cam_base', {}).get(self.robot_id)
+        if not entries:
+            return
+
+        def signed(lo, hi):
+            return float(np.random.uniform(lo, hi) * np.random.choice([-1.0, 1.0]))
+
+        # =========================================================================
+        # CAMERA PERTURBATION SETTINGS
+        # Edit these variables to adjust the domain randomization properties.
+        # =========================================================================
+        
+        # --- Translation Offsets (Meters) ---
+        dx = signed(0.0, 0.020)
+        dy = signed(0.0, 0.020)
+        dz = signed(0.0, 0.010)
+
+        # --- Rotation Offsets (Degrees) ---
+        pitch_max_deg = 1.0   # Up/down tilt variance
+        yaw_max_deg   = 0.5   # Left/right pan variance
+        roll_max_deg  = 0.35  # In-plane roll variance (set to 0.0 to disable)
+
+        # =========================================================================
+
+        d_pitch = signed(0.0, np.deg2rad(pitch_max_deg)) if pitch_max_deg > 0 else 0.0
+        d_yaw   = signed(0.0, np.deg2rad(yaw_max_deg))   if yaw_max_deg   > 0 else 0.0
+        d_roll  = signed(0.0, np.deg2rad(roll_max_deg))  if roll_max_deg  > 0 else 0.0
+
+        delta_rot = Rot.from_euler('xyz', [d_pitch, d_yaw, d_roll])
+
+        for def_name, node, base_trans, base_rot_aa in entries:
+            # Apply translation
+            node.getField('translation').setSFVec3f([
+                base_trans[0] + dx,
+                base_trans[1] + dy,
+                base_trans[2] + dz,
+            ])
+
+            # Apply local rotation matrix
+            ax, ay, az, angle = base_rot_aa
+            nominal  = Rot.from_rotvec(np.array([ax, ay, az]) * angle)
+            combined = nominal * delta_rot          
+            rotvec   = combined.as_rotvec()
+            new_angle = float(np.linalg.norm(rotvec))
+            
+            if new_angle < 1e-9:
+                new_axis  = [0.0, 1.0, 0.0]
+                new_angle = 0.0
+            else:
+                new_axis = (rotvec / new_angle).tolist()
+            node.getField('rotation').setSFRotation(new_axis + [new_angle])
+
+        print(f"[CAM RAND R{self.robot_id}] "
+              f"Δxyz=({dx*100:.2f},{dy*100:.2f},{dz*100:.2f}) cm  "
+              f"Δpitch={np.rad2deg(d_pitch):.2f}°  "
+              f"Δyaw={np.rad2deg(d_yaw):.2f}°  "
+              f"Δroll={np.rad2deg(d_roll):.2f}°")
+
+    # ------------------------------------------------------------------
+    # HARDWARE INITIALIZATION & CONTROL (--real mode)
+    # ------------------------------------------------------------------
+
     def _init_realsense(self):
+        """Initializes direct PyRealSense2 hardware stream."""
         if not REALSENSE_AVAILABLE:
-            rospy.logerr("[REAL] pyrealsense2 not installed. Required for real mode.")
+            rospy.logerr("[REAL] pyrealsense2 not installed - cannot run in real mode")
             raise RuntimeError("pyrealsense2 required for --real mode")
 
         self._rs_pipeline = rs.pipeline()
@@ -297,40 +544,129 @@ class SimulationClient:
         cfg.enable_stream(rs.stream.depth, 640, 360, rs.format.z16,  30)
         profile = self._rs_pipeline.start(cfg)
 
-        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_sensor      = profile.get_device().first_depth_sensor()
         self._rs_depth_scale = depth_sensor.get_depth_scale()
-        self._rs_align = rs.align(rs.stream.color)
+        self._rs_align    = rs.align(rs.stream.color)
 
-        self._rs_spatial = rs.spatial_filter()
+        self._rs_spatial  = rs.spatial_filter()
         self._rs_temporal = rs.temporal_filter()
         self._rs_holefill = rs.hole_filling_filter()
 
+        # Warm up buffer
         for _ in range(30):
             self._rs_pipeline.wait_for_frames()
         rospy.loginfo("[REAL] RealSense D455 ready")
 
     def _capture_realsense(self):
-        frames = self._rs_pipeline.wait_for_frames(timeout_ms=5000)
-        aligned = self._rs_align.process(frames)
-        c_frame = aligned.get_color_frame()
-        d_frame = aligned.get_depth_frame()
+        """Polls and processes the next RealSense frame."""
+        frames   = self._rs_pipeline.wait_for_frames(timeout_ms=5000)
+        aligned  = self._rs_align.process(frames)
+        c_frame  = aligned.get_color_frame()
+        d_frame  = aligned.get_depth_frame()
         if not c_frame or not d_frame:
             return None, None
-            
         d_frame = self._rs_spatial.process(d_frame)
         d_frame = self._rs_temporal.process(d_frame)
         d_frame = self._rs_holefill.process(d_frame)
-        
-        rgb = np.asanyarray(c_frame.get_data())
+        rgb   = np.asanyarray(c_frame.get_data())
         depth = np.asanyarray(d_frame.get_data()).astype(np.float32) * self._rs_depth_scale
         return rgb, depth
 
+    def _init_ros_camera(self):
+        """
+        Subscribes to external ROS camera nodes instead of direct SDK access.
+        Used primarily for headless deployments (e.g. Raspberry Pi).
+        """
+        if not ROS_AVAILABLE:
+            raise RuntimeError("[ROS CAM] ROS is not available — cannot use --ros-camera mode")
+
+        ns = '/camera2' if self.robot_id == 2 else '/camera'
+
+        self._ros_cam_lock  = threading.Lock()
+        self._ros_rgb_frame  = None
+        self._ros_depth_frame = None
+        self._ros_cam_ready  = False
+
+        rospy.Subscriber(f'{ns}/color/image_raw', Image, self._ros_rgb_cb, queue_size=1, buff_size=2**24)
+        rospy.Subscriber(f'{ns}/aligned_depth_to_color/image_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
+        rospy.Subscriber(f'{ns}/depth/image_rect_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
+
+        rospy.loginfo(f"[ROS CAM R{self.robot_id}] Waiting for first frames on {ns}...")
+        deadline = time.time() + 15.0
+        rate = rospy.Rate(10)
+        while not self._ros_cam_ready and not rospy.is_shutdown():
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"[ROS CAM R{self.robot_id}] Timed out waiting for camera on {ns}. "
+                    "Is realsense2_camera running?"
+                )
+            rate.sleep()
+        rospy.loginfo(f"[ROS CAM R{self.robot_id}] Camera ready on {ns}")
+
+    @staticmethod
+    def _imgmsg_to_numpy(msg, encoding):
+        """Decodes ROS sensor_msgs/Image to numpy arrays without cv_bridge dependency."""
+        dtype_map = {
+            'rgb8':   (np.uint8,  3),
+            'bgr8':   (np.uint8,  3),
+            'mono8':  (np.uint8,  1),
+            '8UC1':   (np.uint8,  1),
+            '8UC3':   (np.uint8,  3),
+            '16UC1':  (np.uint16, 1),
+            '32FC1':  (np.float32, 1),
+        }
+        if encoding not in dtype_map:
+            raise ValueError(f"Unsupported encoding: {encoding}")
+        dtype, channels = dtype_map[encoding]
+        frame = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.width, channels)
+        if channels == 1:
+            frame = frame[:, :, 0]
+        if encoding == 'rgb8':
+            frame = frame[:, :, ::-1].copy()
+        return frame
+
+    def _ros_rgb_cb(self, msg):
+        try:
+            enc = msg.encoding if msg.encoding else 'rgb8'
+            frame = self._imgmsg_to_numpy(msg, enc)
+            if frame.ndim == 3 and frame.shape[2] == 3 and enc not in ('bgr8', '8UC3'):
+                frame = frame[:, :, ::-1].copy()  
+            with self._ros_cam_lock:
+                self._ros_rgb_frame = frame
+                if self._ros_depth_frame is not None:
+                    self._ros_cam_ready = True
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[ROS CAM R{self.robot_id}] RGB decode error: {e}")
+
+    def _ros_depth_cb(self, msg):
+        try:
+            enc = msg.encoding if msg.encoding else '16UC1'
+            raw = self._imgmsg_to_numpy(msg, enc)
+            depth_m = raw.astype(np.float32) / 1000.0
+            with self._ros_cam_lock:
+                self._ros_depth_frame = depth_m
+                if self._ros_rgb_frame is not None:
+                    self._ros_cam_ready = True
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[ROS CAM R{self.robot_id}] Depth decode error: {e}")
+
+    def _capture_ros_camera(self):
+        """Fetches the latest async cached frame from ROS subscribers."""
+        with self._ros_cam_lock:
+            rgb   = self._ros_rgb_frame
+            depth = self._ros_depth_frame
+        if rgb is None or depth is None:
+            return None, None
+        return rgb.copy(), depth.copy()
+
     def _init_real_robot_motion(self):
+        """Establishes actionlib client connections to UR3e trajectory hardware."""
         self.robot_controller, self.gripper_controller, self.motion_planner = \
             create_robot_system(
                 config_path="config/robot_config.yaml",
-                simulation=False,   
-                webots_bridge=None
+                simulation=False,    
+                webots_bridge=None,
+                robot_id=self.robot_id
             )
 
         self._traj_client = None
@@ -338,16 +674,18 @@ class SimulationClient:
             rospy.logwarn("[REAL] actionlib not available - motion will be stubbed")
             return
 
-        UR3_ACTION = '/scaled_pos_joint_traj_controller/follow_joint_trajectory'
+        ns = '/ur3_robot2' if self.robot_id == 2 else ''
+        UR3_ACTION = f'{ns}/scaled_pos_joint_traj_controller/follow_joint_trajectory'
         self._traj_client = actionlib.SimpleActionClient(UR3_ACTION, FollowJointTrajectoryAction)
-        connected = self._traj_client.wait_for_server(timeout=rospy.Duration(10.0))
-        if connected:
+        
+        if self._traj_client.wait_for_server(timeout=rospy.Duration(10.0)):
             rospy.loginfo("[REAL] UR3e trajectory action server connected")
         else:
             rospy.logwarn("[REAL] Could not connect to trajectory server.")
             self._traj_client = None
 
-        rospy.Subscriber('/joint_states', JointState, self._real_joint_state_cb)
+        js_topic = '/ur3_robot2/joint_states' if self.robot_id == 2 else '/joint_states'
+        rospy.Subscriber(js_topic, JointState, self._real_joint_state_cb)
 
     def _real_joint_state_cb(self, msg):
         NAMES = ['shoulder_pan_joint','shoulder_lift_joint','elbow_joint',
@@ -357,13 +695,18 @@ class SimulationClient:
         self.robot_controller.joints_state = joints
 
     def _send_real_joints(self, joints: List[float], duration: float):
+        """
+        Translates waypoints to joint trajectory payloads and dispatches them 
+        to the real UR hardware. Blocks execution until hardware arrival.
+        """
         NAMES = ['shoulder_pan_joint','shoulder_lift_joint','elbow_joint',
                  'wrist_1_joint','wrist_2_joint','wrist_3_joint']
 
         wait_timeout = duration * 25.0 + 15.0
 
         if self._traj_client is None:
-            rospy.logwarn(f"[REAL STUB] Move joints {[round(j,3) for j in joints]} (duration {duration:.1f}s)")
+            rospy.logwarn(f"[REAL STUB] Move joints {[round(j,3) for j in joints]} "
+                          f"(duration {duration:.1f}s)")
             rospy.sleep(duration)
             return True
 
@@ -373,8 +716,8 @@ class SimulationClient:
         traj = JointTrajectory()
         traj.joint_names = NAMES
         pt = JointTrajectoryPoint()
-        pt.positions = joints
-        pt.velocities = [0.0] * 6
+        pt.positions       = joints
+        pt.velocities      = [0.0] * 6
         pt.time_from_start = rospy.Duration(duration)
         traj.points = [pt]
         goal.trajectory = traj
@@ -383,40 +726,43 @@ class SimulationClient:
         finished = self._traj_client.wait_for_result(timeout=rospy.Duration(wait_timeout))
 
         if not finished:
-            rospy.logerr(f"[REAL] Trajectory timed out. Cancelling goal.")
+            rospy.logerr("[REAL] Trajectory timed out. Cancelling goal.")
             self._traj_client.cancel_goal()
             return False
 
-        state = self._traj_client.get_state()
-        if state != actionlib.GoalStatus.SUCCEEDED:
-            rospy.logwarn(f"[REAL] Trajectory ended with action state {state}.")
+        if self._traj_client.get_state() != actionlib.GoalStatus.SUCCEEDED:
+            rospy.logwarn("[REAL] Trajectory Action failed. Check robot emergency status.")
             return False
 
         return True
 
     def _init_robotiq_gripper(self):
-        self._gripper_ready = False
+        """Bootstraps Robotiq gripper communications over ROS."""
+        self._gripper_ready  = False
         self._gripper_status = None
-        self._gripper_pub = None
+        self._gripper_pub    = None
 
         if not ROBOTIQ_AVAILABLE or not ROS_AVAILABLE:
-            rospy.logwarn("[REAL] Robotiq package not found. Gripper stubbed.")
+            rospy.logwarn("[REAL] Robotiq package not found — gripper stubbed.")
             return
 
+        ns = '/ur3_robot2' if self.robot_id == 2 else '/ur3_robot1'
+        
         self._gripper_pub = rospy.Publisher(
-            'Robotiq2FGripperRobotOutput',
+            f'{ns}/Robotiq2FGripperRobotOutput',
             RobotiqOutput.Robotiq2FGripper_robot_output,
             queue_size=10,
             latch=True)   
 
         rospy.Subscriber(
-            'Robotiq2FGripperRobotInput',
+            f'{ns}/Robotiq2FGripperRobotInput',
             RobotiqInput.Robotiq2FGripper_robot_input,
             self._gripper_status_cb)
 
         rospy.sleep(2.0)
         rospy.loginfo("[REAL] Gripper publisher registered")
 
+        # Cycle Hardware Reset
         rospy.loginfo("[REAL] Resetting gripper...")
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
         cmd.rACT = 0
@@ -425,22 +771,20 @@ class SimulationClient:
             rospy.sleep(0.1)
         rospy.sleep(0.5)             
 
+        # Activate
         rospy.loginfo("[REAL] Activating gripper...")
-        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
-        cmd.rACT = 1
-        cmd.rGTO = 1
-        cmd.rSP = 255
-        cmd.rFR = 150
+        cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP  = 255; cmd.rFR  = 150
         for _ in range(10):          
             self._gripper_pub.publish(cmd)
             rospy.sleep(0.1)
 
+        # Confirm
         deadline = time.time() + 8.0
         while not self._gripper_ready and time.time() < deadline:
             rospy.sleep(0.1)
 
         if self._gripper_ready:
-            rospy.loginfo("[REAL] Robotiq 2F activated.")
+            rospy.loginfo("[REAL] Robotiq 2F activated ✓")
         else:
             rospy.logwarn("[REAL] Gripper activation timed out.")
             self._gripper_ready = True
@@ -452,7 +796,6 @@ class SimulationClient:
 
     def _gripper_open(self):
         if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
-            rospy.loginfo("[GRIPPER STUB] Open")
             return
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
         cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP = 255; cmd.rFR = 150; cmd.rPR = 0
@@ -461,7 +804,6 @@ class SimulationClient:
 
     def _gripper_close(self):
         if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
-            rospy.loginfo("[GRIPPER STUB] Close")
             return
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
         cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP = 255; cmd.rFR = 150; cmd.rPR = 255
@@ -469,6 +811,7 @@ class SimulationClient:
         rospy.sleep(1.5)
 
     def _gripper_reactivate(self):
+        """Ensures gripper logic is synced to physical state per episode."""
         if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
             return
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
@@ -482,38 +825,40 @@ class SimulationClient:
         return self._gripper_status.gOBJ in (1, 2)
 
     def _execute_real_grasp(self, prediction: Dict):
+        """
+        Executes a grasp sequence on the physical hardware based on network output.
+        Safeguards execution via IK filtering and static height geometry limits.
+        """
         import math as _m
 
         raw_pose = list(prediction['pose'])
         rospy.loginfo(f"[REAL] Network output: {raw_pose}")
 
-        raw_pose[0] = raw_pose[0]   
-        raw_pose[2] = raw_pose[2]  
-        rospy.loginfo(f"[REAL] Rescaled x={raw_pose[0]:.4f}  z={raw_pose[2]:.4f}")
-
+        # Webots coordinate bounds filtering
         pose = raw_pose.copy()
         pose[0] = float(np.clip(pose[0], -0.862, -0.578))   
         pose[1] = float(np.clip(pose[1],  0.420,  0.460))   
-        pose[2] = float(np.clip(pose[2],  0.65,  0.972))   
+        pose[2] = float(np.clip(pose[2],  0.65,  0.972))    
+        
         if any(abs(raw_pose[i] - pose[i]) > 0.001 for i in range(3)):
-            rospy.loginfo(f"[REAL CLAMP] {raw_pose[:3]} -> {pose[:3]}")
+            rospy.loginfo(f"[REAL CLAMP] {raw_pose[:3]} → {pose[:3]}")
 
         x, y, z = pose[0], pose[1], pose[2]
-        yaw = pose[5]
+        yaw     = pose[5]
 
+        # Convert to UR3 Base Frame
         ik_x, ik_y, _ = self.robot_controller.transform_real_to_ur3(x, y, z)
 
-        PLATFORM_Z = 0.068   
+        # Hardcoded geometrical safety heights (Meters from base)
+        PLATFORM_Z   = 0.068   
         FLOOR_MARGIN = 0.050   
-        GRIPPER_OFF = 0.129   
-        HOVER_OFF = 0.08    
+        GRIPPER_OFF  = 0.129   
+        HOVER_OFF    = 0.08    
 
         target_z = PLATFORM_Z + FLOOR_MARGIN        
         grasp_z  = target_z   + GRIPPER_OFF         
         hover_z  = grasp_z    + HOVER_OFF           
         safe_z   = hover_z    + 0.05                
-
-        rospy.loginfo(f"[REAL] Height: platform={PLATFORM_Z:.3f} grasp={grasp_z:.3f} hover={hover_z:.3f} safe={safe_z:.3f}")
 
         WRIST_ANGLE = _m.pi   
 
@@ -521,25 +866,28 @@ class SimulationClient:
             return min(abs(a), 2 * _m.pi - abs(a))
 
         def solve_wp(tx, ty, tz):
+            """Analytically computes IK with heuristic filtering for safe paths."""
             R_down = np.array([[ 0, -1,  0], [-1,  0,  0], [ 0,  0, -1]])
             cy, sy = _m.cos(yaw), _m.sin(yaw)
-            R_yaw = np.array([[cy, -sy, 0], [sy,  cy, 0], [ 0,   0, 1]])
-            T = np.eye(4)
-            T[:3, 3] = [tx, ty, tz]
-            T[:3, :3] = R_yaw @ R_down
+            R_yaw  = np.array([[cy, -sy, 0], [sy,  cy, 0], [ 0,   0, 1]])
+            T           = np.eye(4)
+            T[:3, 3]    = [tx, ty, tz]
+            T[:3, :3]   = R_yaw @ R_down
 
             sols = self.robot_controller._solve_ik_analytical(T)
             if not sols:
                 return None
 
-            J0_SAFE_MIN = math.radians(35)    
-            J0_SAFE_MAX = math.radians(95)    
-            J0_FIND_MIN = math.radians(30)    
-            J0_FIND_MAX = math.radians(130)   
-            valid = [s for s in sols if J0_FIND_MIN < s[0] < J0_FIND_MAX and s[1] < 0.0 and s[2] > 0.0]
+            J0_SAFE_MIN, J0_SAFE_MAX = math.radians(35), math.radians(95)
+            J0_FIND_MIN, J0_FIND_MAX = math.radians(30), math.radians(130)
             
+            valid = [s for s in sols
+                     if J0_FIND_MIN < s[0] < J0_FIND_MAX
+                     and s[1] < 0.0
+                     and s[2] > 0.0]
+                     
             if not valid:
-                rospy.logerr(f"[REAL] No elbow-down solution in range.")
+                rospy.logerr("[REAL] No viable elbow-down IK solution in range.")
                 return None
 
             cur = np.array(self.robot_controller.joints_state)
@@ -558,20 +906,18 @@ class SimulationClient:
             best[5] = WRIST_ANGLE   
             return best
 
-        rospy.loginfo(f"[REAL] IK target: ({ik_x:.3f}, {ik_y:.3f})")
-
-        j_safe = solve_wp(ik_x, ik_y, safe_z)
+        j_safe  = solve_wp(ik_x, ik_y, safe_z)
         j_hover = solve_wp(ik_x, ik_y, hover_z)
         j_grasp = solve_wp(ik_x, ik_y, grasp_z)
 
         if not all([j_safe, j_hover, j_grasp]):
-            rospy.logerr("[REAL] IK failed — skipping grasp")
+            rospy.logerr("[REAL] IK generation failed — skipping grasp")
             return
 
         HOME = list(self.robot_controller.get_home_joints(simulation=False))
-        HOME[5] = WRIST_ANGLE   
+        HOME[5] = WRIST_ANGLE  
 
-        JOINT_SPEED = 0.5   
+        JOINT_SPEED  = 0.5   
         MIN_DURATION = 1.5   
 
         def duration_for(j_from, j_to):
@@ -584,42 +930,49 @@ class SimulationClient:
         self._gripper_reactivate()
         self._gripper_open()
 
-        rospy.loginfo("[REAL] Moving to Hover")
+        # Step 1: Hover
+        rospy.loginfo("[REAL] → Hover")
         self._send_real_joints(j_hover, duration_for(j_safe, j_hover))
 
-        HOME_BASE_ANGLE = _m.pi / 2   
+        # Step 2: Wrist Compensation Matrix
+        HOME_BASE_ANGLE  = _m.pi / 2   
         HOME_WRIST_ANGLE = _m.pi       
         base_delta = j_hover[0] - HOME_BASE_ANGLE
         wrist_compensated = HOME_WRIST_ANGLE + base_delta
 
         j_hover_comp = list(j_hover)
         j_hover_comp[5] = wrist_compensated
-        rospy.loginfo(f"[REAL] Hover wrist compensated")
         self._send_real_joints(j_hover_comp, duration_for(j_hover, j_hover_comp))
 
+        # Step 3: Descend
         j_grasp_comp = list(j_grasp)
         j_grasp_comp[5] = wrist_compensated
-        rospy.loginfo("[REAL] Descending")
+        rospy.loginfo("[REAL] → Descend")
         self._send_real_joints(j_grasp_comp, duration_for(j_hover_comp, j_grasp_comp))
-        rospy.sleep(0.5)   
+        rospy.sleep(0.5)
 
-        rospy.loginfo("[REAL] Closing gripper")
+        # Step 4: Close Gripper
+        rospy.loginfo("[REAL] → Closing gripper")
         self._gripper_close()
         rospy.sleep(1.0)   
 
         success = self._gripper_grasped()
-        status_msg = "SUCCESS" if success else "FAIL"
-        rospy.loginfo(f"[REAL] Grasp {status_msg}")
+        rospy.loginfo(f"[REAL] Grasp {'SUCCESS ✓' if success else 'FAIL ✗'}")
 
-        rospy.loginfo("[REAL] Lifting straight up")
+        # Step 5: Retreat & Reset
+        rospy.loginfo("[REAL] → Lift straight up")
         self._send_real_joints(j_safe, duration_for(j_grasp_comp, j_safe))
-
-        rospy.loginfo("[REAL] Returning home")
+        
+        rospy.loginfo("[REAL] → Return home")
         self._send_real_joints(HOME, duration_for(j_safe, HOME))
 
         rospy.sleep(1.0)
         self._gripper_open()
-        rospy.loginfo("[REAL] Cycle complete")
+        return success
+
+    # ------------------------------------------------------------------
+    # GENERAL SIMULATION PIPELINES
+    # ------------------------------------------------------------------
 
     def _load_config(self, config_path: str) -> Dict:
         try:
@@ -629,8 +982,8 @@ class SimulationClient:
             return {'network': {'host_ip': '192.168.1.133', 'host_port': 8888}}
 
     def _setup_ros_interface(self):
-        self.rgb_sub = rospy.Subscriber('/camera/image_raw', Image, self._rgb_callback)
-        self.depth_sub = rospy.Subscriber('/camera/depth/image_raw', Image, self._depth_callback)
+        self.rgb_sub         = rospy.Subscriber('/camera/image_raw', Image, self._rgb_callback)
+        self.depth_sub       = rospy.Subscriber('/camera/depth/image_raw', Image, self._depth_callback)
         self.joint_state_sub = rospy.Subscriber('/ur3/joint_states', JointState, self._joint_state_callback)
 
     def _rgb_callback(self, msg):
@@ -643,7 +996,8 @@ class SimulationClient:
         self.latest_joint_states = {'positions': list(msg.position)}
 
     def connect_to_host(self) -> bool:
-        host_ip = self.config['network']['host_ip']
+        """Establishes connection to GPU server network component."""
+        host_ip   = self.config['network']['host_ip']
         host_port = self.config['network']['host_port']
         try:
             with self.connection_lock:
@@ -658,15 +1012,15 @@ class SimulationClient:
             return False
 
     def _send_camera_data_to_host(self):
+        """Serializes and dispatches local camera buffer to inference server."""
         try:
             if self.latest_rgb_image is None:
                 return
 
             data_dir = Path("~/catkin_ws/src/vm_simulation_system/data").expanduser()
             data_dir.mkdir(parents=True, exist_ok=True)
-            
-            save_path = data_dir / "latest_camera_view.jpg"
-            cv2.imwrite(str(save_path), self.latest_rgb_image)
+            cv2.imwrite(str(data_dir / f"latest_camera_view_r{self.robot_id}.jpg"),
+                        self.latest_rgb_image)
 
             _, rgb_enc = cv2.imencode('.jpg', self.latest_rgb_image)
             self.latest_rgb_b64 = base64.b64encode(rgb_enc).decode('utf-8')
@@ -679,22 +1033,43 @@ class SimulationClient:
             else:
                 self.latest_depth_b64 = ""
 
-            payload  = {
-                'type':   'camera_data',
-                'data':   {'rgb': self.latest_rgb_b64, 'depth': self.latest_depth_b64},
-                'mode':   self.mode,
-                'source': 'real' if self.real_robot else 'simulation'
+            payload = {
+                'type':     'camera_data',
+                'data':     {'rgb': self.latest_rgb_b64, 'depth': self.latest_depth_b64},
+                'mode':     self.mode,
+                'source':   'real' if self.real_robot else 'simulation',
+                'robot_id': self.robot_id,
             }
+            
             response = self._send_message_to_host(payload)
             if response and response.get('type') == 'grasp_prediction':
                 if self.real_robot:
-                    self._execute_real_grasp(response)
+                    success = self._execute_real_grasp(response)
+                    if success is None:
+                        success = False
+                    
+                    self.episode_count += 1
+                    self.last_grasp_mode = response.get('mode', 'exploit')
+                    status = chr(10003) if success else chr(10007)
+                    rospy.loginfo(f"[REAL R{self.robot_id}] {status} Episode {self.episode_count} complete — waiting at barrier")
+                    
+                    barrier_resp = self._send_message_to_host({
+                        'type':     'episode_end',
+                        'success':  success,
+                        'robot_id': self.robot_id,
+                    })
+                    
+                    if barrier_resp and barrier_resp.get('type') == 'proceed':
+                        rospy.loginfo(f"[REAL R{self.robot_id}] Barrier cleared — starting next capture cycle")
+                    else:
+                        rospy.logwarn(f"[REAL R{self.robot_id}] Unexpected barrier response: {barrier_resp}")
                 else:
                     self._execute_grasp_prediction(response)
         except Exception as e:
-            rospy.logerr(f"Camera Send Error: {e}")
+            rospy.logerr(f"Camera Send Error (R{self.robot_id}): {e}")
 
     def _send_message_to_host(self, message: Dict) -> Optional[Dict]:
+        """Handles low level socket transmissions to remote servers."""
         if not self.connected:
             return None
         try:
@@ -720,9 +1095,10 @@ class SimulationClient:
             return None
 
     def _calculate_shaped_reward(self, success: bool, closest_dist: float) -> float:
+        """Returns reinforcement shaping signals for model training."""
         WRIST_OFFSET = 0.060
-        CUTOFF_DIST = 0.20
-        DECAY = 15.0
+        CUTOFF_DIST  = 0.20
+        DECAY        = 15.0
 
         finger_dist = max(0.0, closest_dist - WRIST_OFFSET)
 
@@ -733,42 +1109,51 @@ class SimulationClient:
         else:
             reward = 0.8 * math.exp(-DECAY * finger_dist)
 
-        print(f"[REWARD] ClosestDist: {closest_dist:.4f}m | FingerDist: {finger_dist:.4f}m | Success: {success} | Reward: {reward:.4f}")
+        print(f"[REWARD] ClosestDist: {closest_dist:.4f}m | FingerDist: {finger_dist:.4f}m | "
+              f"Success: {success} | Reward: {reward:.4f}")
         return float(reward)
 
     def _generate_guided_random_grasp(self) -> List[float]:
+        """Provides an algorithmic teacher path for the 'explore' policy block."""
+        robot_id = self.robot_id
+        if robot_id == 2:
+            object_def   = "TARGET_OBJECT2"
+            ROBOT_BASE_X = -1.226
+            ROBOT_BASE_Z =  0.47235
+            fallback     = [-1.365, 0.44, 0.905, 3.14, 0.0, 0.0]
+        else:
+            object_def   = "TARGET_OBJECT"
+            ROBOT_BASE_X = -0.685
+            ROBOT_BASE_Z =  0.47235
+            fallback     = [-0.685, 0.44, 0.55, 3.14, 0.0, 0.0]
+
         try:
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
 
-            duck_node = supervisor.getFromDef("TARGET_OBJECT")
+            duck_node = supervisor.getFromDef(object_def)
             if not duck_node:
-                rospy.logwarn("Target Object not found!")
-                return [-0.685, 0.44, 0.55, 3.14, 0, 0]
+                rospy.logwarn(f"[GUIDED] {object_def} not found!")
+                return fallback
 
             d_pos = np.array(duck_node.getPosition())
 
             if np.any(np.isnan(d_pos)):
                 if not self._nan_reset_pending:
-                    print("[NaN GUARD] Object position returned NaN. Triggering one-time sim reset.")
+                    rospy.logwarn(f"[NaN GUARD R{robot_id}] Object NaN — resetting once.")
                     self._nan_reset_pending = True
                     self._reset_simulation_for_nan()
-                else:
-                    print("[NaN GUARD] NaN still present after reset; skipping episode.")
-                return [-0.685, 0.44, 0.55, 3.14, 0.0, 0.0]
-
-            ROBOT_BASE_X = -0.685
-            ROBOT_BASE_Z =  0.47235
+                return fallback
 
             dx = d_pos[0] - ROBOT_BASE_X
             dz = d_pos[2] - ROBOT_BASE_Z
 
-            dist_to_obj = np.sqrt(dx**2 + dz**2)
+            dist_to_obj  = np.sqrt(dx**2 + dz**2)
             angle_to_obj = np.arctan2(dz, dx)
 
-            REACH_OFFSET = -0.105
-            SHIFT_OFFSET =  0.1  
+            REACH_OFFSET  = -0.095
+            SHIFT_OFFSET  =  0.1
             HEIGHT_OFFSET =  0.02
 
             final_dist = dist_to_obj + REACH_OFFSET
@@ -777,45 +1162,51 @@ class SimulationClient:
             target_z = ROBOT_BASE_Z + (final_dist * np.sin(angle_to_obj)) + (SHIFT_OFFSET * np.cos(angle_to_obj))
             target_y = d_pos[1] + HEIGHT_OFFSET
 
-            x = target_x + np.random.uniform(-0.005, 0.005)
-            y = target_y + np.random.uniform(0.005,  0.005)
+            x = target_x + np.random.uniform(-0.005, 0.005) 
+            y = target_y  
             z = target_z + np.random.uniform(-0.005, 0.005)
 
             yaw = angle_to_obj
 
-            print(f"[CLIENT] Target: {x:.3f}, {y:.3f}, {z:.3f} | Reach Adj: {REACH_OFFSET}")
+            print(f"[CLIENT R{robot_id}] Target: {x:.3f}, {y:.3f}, {z:.3f} | Reach Adj: {REACH_OFFSET}")
             return [float(x), float(y), float(z), 3.14, 0.0, float(yaw)]
 
         except Exception as e:
-            rospy.logerr(f"Guided Random Error: {e}")
-            return [-0.685, 0.44, 0.55, 0, 0, 0]
+            rospy.logerr(f"Guided Random Error (R{robot_id}): {e}")
+            return fallback
 
     def _execute_grasp_prediction(self, prediction: Dict):
+        """Processes the neural network outputs inside Webots Simulation."""
+        robot_id = self.robot_id
         try:
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
 
-            duck_node = supervisor.getFromDef("TARGET_OBJECT")
-            initial_y = 0.0
+            object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
+            if robot_id == 2:
+                CLAMP_X = (-1.457, -1.093)
+            else:
+                CLAMP_X = (-0.90, -0.50)
+            CLAMP_Z = (0.70, 1.05)
+
+            duck_node  = supervisor.getFromDef(object_def)
+            initial_y  = 0.0
             node_found = False
             self.last_grasp_mode = prediction.get('mode', 'exploit')
 
             if duck_node:
-                initial_y = duck_node.getPosition()[1]
+                initial_y  = duck_node.getPosition()[1]
                 node_found = True
 
                 if math.isnan(initial_y) or any(math.isnan(v) for v in duck_node.getPosition()):
                     if not self._nan_reset_pending:
-                        print("[NaN GUARD] NaN detected before grasp. Triggering one-time sim reset.")
+                        rospy.logwarn(f"[NaN GUARD R{robot_id}] NaN at grasp start — resetting once.")
                         self._nan_reset_pending = True
                         self._reset_simulation_for_nan()
                     else:
-                        print("[NaN GUARD] NaN still present after reset; skipping episode.")
-                    self.end_current_episode(False)
-                    self.robot_controller.home_position()
-                    time.sleep(2.0)
-                    self.start_new_episode()
+                        rospy.logwarn(f"[NaN GUARD R{robot_id}] NaN persists — skipping episode.")
+                    self._end_episode_and_restart(False)
                     return
 
             current_state = {'rgb': self.latest_rgb_b64, 'depth': self.latest_depth_b64}
@@ -825,13 +1216,15 @@ class SimulationClient:
                 pose = self._generate_guided_random_grasp()
             else:
                 raw_pose = list(prediction['pose'])
-                print(f"[AI PREDICTION] Network output: {raw_pose}")
+                print(f"[AI PREDICTION R{robot_id}] Network output: {raw_pose}")
                 pose = raw_pose.copy()
-                pose[0] = float(np.clip(pose[0], -0.90, -0.50))   
-                pose[1] = float(np.clip(pose[1], 0.483, 0.490))   
-                pose[2] = float(np.clip(pose[2],  0.70,  1.05))   
+                pose[0] = float(np.clip(pose[0], CLAMP_X[0], CLAMP_X[1]))
+                pose[1] = float(np.clip(pose[1], 0.483, 0.490))
+                pose[2] = float(np.clip(pose[2], CLAMP_Z[0], CLAMP_Z[1]))
+                
                 if raw_pose[0] != pose[0] or raw_pose[1] != pose[1] or raw_pose[2] != pose[2]:
-                    print(f"[AI CLAMP] Clamped: [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}] -> [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
+                    print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
+                          f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
 
             self.robot_controller._closest_approach_dist = 9999.0
             self.robot_controller.execute_grasp(pose)
@@ -840,16 +1233,16 @@ class SimulationClient:
 
             success = False
             if node_found:
-                final_y = duck_node.getPosition()[1]
+                final_y    = duck_node.getPosition()[1]
                 lift_delta = final_y - initial_y
                 REQUIRED_LIFT = 0.023
                 success = lift_delta > REQUIRED_LIFT
-                status = "SUCCESS" if success else "FAIL"
-                print(f"[RESULT] {status}. Lifted {lift_delta:.4f}m (Threshold: {REQUIRED_LIFT}m)")
+                status  = "SUCCESS" if success else "FAIL"
+                print(f"[RESULT R{robot_id}] {status}. Lifted {lift_delta:.4f}m")
                 if not math.isnan(lift_delta):
                     self._nan_reset_pending = False
             else:
-                print("[RESULT] FAIL. Object not found.")
+                print(f"[RESULT R{robot_id}] FAIL. Object not found.")
 
             reward = self._calculate_shaped_reward(success, closest_dist)
 
@@ -869,58 +1262,67 @@ class SimulationClient:
                 }
 
                 network_action = [
-                    pose[0],   
-                    pose[1],   
-                    pose[2],   
-                    3.14,      
-                    0.0,       
-                    pose[5],   
+                    pose[0], pose[1], pose[2],
+                    3.14, 0.0, pose[5],
                 ]
 
                 obj_pos = [0.0, 0.0]
                 if duck_node:
                     dp = duck_node.getPosition()
-                    obj_pos = [float(dp[0]), float(dp[2])]  
+                    obj_pos = [float(dp[0]), float(dp[2])]
 
                 self._send_message_to_host({
-                    'type': 'training_data',
-                    'source': 'real' if self.real_robot else 'simulation',
+                    'type':     'training_data',
+                    'source':   'simulation',
+                    'robot_id': robot_id,
                     'data': {
                         'state':      current_state,
                         'action':     network_action,
                         'reward':     reward,
                         'next_state': next_state,
                         'done':       True,
-                        'mode':       mode,       
-                        'object_pos': obj_pos,    
+                        'mode':       mode,
+                        'object_pos': obj_pos,
                     }
                 })
 
-            self.end_current_episode(success)
-            self.robot_controller.home_position()
-            time.sleep(2.0)
-            self.start_new_episode()
+            self._end_episode_and_restart(success)
 
         except Exception as e:
-            rospy.logerr(f"Grasp Execution Error: {e}")
+            rospy.logerr(f"Grasp Execution Error (R{robot_id}): {e}")
+
+    def _end_episode_and_restart(self, success: bool):
+        """Records episode results and issues environment resets."""
+        self.end_current_episode(success)
+        self.robot_controller.home_position()
+
+        print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
+        response = self._send_message_to_host({
+            'type':     'episode_end',
+            'success':  success,
+            'robot_id': self.robot_id
+        })
+        if response and response.get('type') == 'proceed':
+            print(f"[BARRIER R{self.robot_id}] Barrier cleared — starting next episode")
+        else:
+            print(f"[BARRIER R{self.robot_id}] Unexpected barrier response: {response}")
+
+        time.sleep(2.0)
+        self.start_new_episode()
 
     def _reset_simulation_for_nan(self):
-        """Resets the Webots environment to recover from NaN position errors."""
+        """Teleports physics entities to reset physics engines resolving NaN anomalies."""
+        robot_id   = self.robot_id
+        object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
+        cx = CurriculumManagerRobot2.PLATFORM_CENTER_X if robot_id == 2 else CurriculumManager.PLATFORM_CENTER_X
+        cz = CurriculumManagerRobot2.PLATFORM_CENTER_Z if robot_id == 2 else CurriculumManager.PLATFORM_CENTER_Z
         try:
-            print("[NaN GUARD] Resetting simulation to recover lost object...")
+            print(f"[NaN GUARD R{robot_id}] 🔄 Re-spawning {object_def} at platform centre...")
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
-
-            supervisor.simulationReset()
-            time.sleep(1.0)
-            self.robot_controller.home_position()
-            time.sleep(2.0)
-
-            obj_node = supervisor.getFromDef("TARGET_OBJECT")
+            obj_node = supervisor.getFromDef(object_def)
             if obj_node:
-                cx = CurriculumManager.PLATFORM_CENTER_X
-                cz = CurriculumManager.PLATFORM_CENTER_Z
                 position_field = obj_node.getField("translation")
                 if position_field:
                     position_field.setSFVec3f([cx, 0.461, cz])
@@ -928,120 +1330,201 @@ class SimulationClient:
                 if rotation_field:
                     rotation_field.setSFRotation([0.0, 1.0, 0.0, 0.0])
                 obj_node.resetPhysics()
-                print(f"[NaN GUARD] Object re-spawned at centre ({cx:.3f}, 0.461, {cz:.3f})")
+                print(f"[NaN GUARD R{robot_id}] ✅ {object_def} re-spawned at ({cx:.3f}, 0.461, {cz:.3f})")
             else:
-                print("[NaN GUARD] TARGET_OBJECT not found during NaN recovery.")
-
+                print(f"[NaN GUARD R{robot_id}] ⚠️  {object_def} not found during NaN recovery.")
         except Exception as e:
-            rospy.logerr(f"[NaN GUARD] Reset failed: {e}")
+            rospy.logerr(f"[NaN GUARD R{robot_id}] Reset failed: {e}")
 
+    @staticmethod
+    def _discover_textures(tex_dir: str) -> list:
+        """Globally fetches available texture assets for platform domain randomization."""
+        import os
+        EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tga'}
+        tex_dir = os.path.expanduser(tex_dir)
+        if not os.path.isdir(tex_dir):
+            return []
+        return sorted(
+            os.path.join(tex_dir, f)
+            for f in os.listdir(tex_dir)
+            if os.path.splitext(f)[1].lower() in EXTENSIONS
+        )
+ 
+    def _apply_platform_texture(self, supervisor, tex_node_def, transform_def,
+                                mat_node_def, tex_images, tex_chance=0.75):
+        """Integrates domain randomizations dynamically to standard platform nodes."""
+        import random, math
+ 
+        floor_tex     = supervisor.getFromDef(tex_node_def)
+        tex_transform = supervisor.getFromDef(transform_def)
+        platform_mat  = supervisor.getFromDef(mat_node_def)
+ 
+        if not floor_tex or not platform_mat:
+            return
+ 
+        url_field = floor_tex.getField("url")
+ 
+        def _set_mat_color(node, r, g, b):
+            t = node.getTypeName()
+            if t == "Material":
+                node.getField("diffuseColor").setSFColor([r, g, b])
+            elif t == "PBRAppearance":
+                node.getField("baseColor").setSFColor([r, g, b])
+                node.getField("roughness").setSFFloat(random.uniform(0.1, 1.0))
+                node.getField("metalness").setSFFloat(random.uniform(0.0, 1.0))
+ 
+        if tex_images and random.random() < tex_chance:
+            img_path = random.choice(tex_images)
+            if url_field.getCount() == 0:
+                url_field.insertMFString(0, img_path)
+            else:
+                url_field.setMFString(0, img_path)
+ 
+            if tex_transform:
+                rotations = [0.0, math.pi / 2, math.pi, 3 * math.pi / 2]
+                tex_transform.getField("rotation").setSFFloat(random.choice(rotations))
+ 
+            _set_mat_color(platform_mat, 1.0, 1.0, 1.0)
+ 
+        else:
+            if url_field.getCount() > 0:
+                url_field.removeMF(0)
+            if tex_transform:
+                tex_transform.getField("rotation").setSFFloat(0.0)
+            pr = random.uniform(0.05, 0.95)
+            pg = random.uniform(0.05, 0.95)
+            pb = random.uniform(0.05, 0.95)
+            _set_mat_color(platform_mat, pr, pg, pb)
+ 
     def _randomize_domain(self):
-        """Applies visual randomization (colors, textures, lighting) to bridge the Sim2Real gap."""
+        """Randomizes the visual properties of the simulator elements to close sim-to-real gap."""
+        import random, math, os
+ 
         try:
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
-
-            import random
-
-            target_node = supervisor.getFromDef("TARGET_OBJECT")
-            if target_node:
-                r, g, b = random.random(), random.random(), random.random()
-                target_node.getField("baseColor").setSFColor([r, g, b])
-
-            floor_mat = supervisor.getFromDef("FLOOR_MATERIAL")           
-            platform_mat = supervisor.getFromDef("PLATFORM_MATERIAL")     
-            floor_tex = supervisor.getFromDef("PLATFORM_TEXTURE")
-            tex_transform = supervisor.getFromDef("PLATFORM_TEX_TRANSFORM")
-
-            if floor_mat and floor_tex and platform_mat:
-                import os
-                import math
-                tex_dir = os.path.expanduser("~/catkin_ws/src/vm_simulation_system/Webots/protos/textures")
-                url_field = floor_tex.getField("url")
-
-                tr, tg, tb = random.uniform(0.1, 0.8), random.uniform(0.1, 0.8), random.uniform(0.1, 0.8)
-                if floor_mat.getTypeName() == "Material":
-                    floor_mat.getField("diffuseColor").setSFColor([tr, tg, tb])
-                elif floor_mat.getTypeName() == "PBRAppearance":
-                    floor_mat.getField("baseColor").setSFColor([tr, tg, tb])
-
-                if random.random() < 0.25: 
-                    plate_images = ["plate1.jpg", "plate2.jpg", "plate3.jpg", "plate4.jpg"] 
-                    chosen_img = random.choice(plate_images)
-                    img_path = os.path.join(tex_dir, chosen_img)
-                    
-                    if url_field.getCount() == 0:
-                        url_field.insertMFString(0, img_path)
-                    else:
-                        url_field.setMFString(0, img_path)
-                        
-                    if tex_transform:
-                        rotations = [0.0, math.pi/2, math.pi, 3*math.pi/2]
-                        tex_transform.getField("rotation").setSFFloat(random.choice(rotations))
-                        
-                    if platform_mat.getTypeName() == "Material":
-                        platform_mat.getField("diffuseColor").setSFColor([1.0, 1.0, 1.0])
-                    elif platform_mat.getTypeName() == "PBRAppearance":
-                        platform_mat.getField("baseColor").setSFColor([1.0, 1.0, 1.0])
-                else:
-                    if url_field.getCount() > 0:
-                        url_field.removeMF(0)
-                        
-                    if tex_transform:
-                        tex_transform.getField("rotation").setSFFloat(0.0)
-                        
-                    pr, pg, pb = random.uniform(0.1, 0.8), random.uniform(0.1, 0.8), random.uniform(0.1, 0.8)
-                    
-                    if platform_mat.getTypeName() == "Material":
-                        platform_mat.getField("diffuseColor").setSFColor([pr, pg, pb])
-                    elif platform_mat.getTypeName() == "PBRAppearance":
-                        platform_mat.getField("baseColor").setSFColor([pr, pg, pb])
-
+ 
+            tex_dir = os.path.expanduser(
+                "~/catkin_ws/src/vm_simulation_system/Webots/protos/textures/Dataset"
+            )
+            tex_images = self._discover_textures(tex_dir)
+            if not tex_images:
+                print("[DOMAIN RAND] No texture images found — using colour-only randomisation")
+ 
+            for obj_def in ("TARGET_OBJECT", "TARGET_OBJECT2"):
+                node = supervisor.getFromDef(obj_def)
+                if node:
+                    node.getField("baseColor").setSFColor(
+                        [random.random(), random.random(), random.random()]
+                    )
+ 
+            self._apply_platform_texture(
+                supervisor,
+                tex_node_def  = "FLOOR_TEXTURE",
+                transform_def = "FLOOR_TEX_TRANSFORM",
+                mat_node_def  = "FLOOR_MATERIAL",
+                tex_images    = tex_images,
+                tex_chance    = 0.90,
+            )
+ 
+            self._apply_platform_texture(
+                supervisor,
+                tex_node_def  = "PLATFORM_TEXTURE",
+                transform_def = "PLATFORM_TEX_TRANSFORM",
+                mat_node_def  = "PLATFORM_MATERIAL",
+                tex_images    = tex_images,
+                tex_chance    = 0.90,
+            )
+            self._apply_platform_texture(
+                supervisor,
+                tex_node_def  = "PLATFORM_TEXTURE2",
+                transform_def = "PLATFORM_TEX_TRANSFORM2",
+                mat_node_def  = "PLATFORM_MATERIAL2",
+                tex_images    = tex_images,
+                tex_chance    = 0.90,
+            )
+ 
             light_node = supervisor.getFromDef("MAIN_LIGHT")
             if light_node:
-                intensity = random.uniform(0.4, 2.5)
-                ambient = random.uniform(0.1, 0.8)
-                light_node.getField("intensity").setSFFloat(intensity)
-                light_node.getField("ambientIntensity").setSFFloat(ambient)
-
-                lr, lg, lb = random.uniform(0.8, 1.0), random.uniform(0.8, 1.0), random.uniform(0.8, 1.0)
-                light_node.getField("color").setSFColor([lr, lg, lb])
-
+                light_node.getField("intensity").setSFFloat(random.uniform(0.2, 4.0))
+                light_node.getField("ambientIntensity").setSFFloat(random.uniform(0.05, 1.0))
+                light_node.getField("color").setSFColor([
+                    random.uniform(0.7, 1.0),
+                    random.uniform(0.7, 1.0),
+                    random.uniform(0.7, 1.0),
+                ])
                 if light_node.getTypeName() == "DirectionalLight":
-                    dir_x = random.uniform(-0.8, 0.8)
-                    dir_y = random.uniform(-1.0, -0.4) 
-                    dir_z = random.uniform(-0.8, 0.8)
-                    light_node.getField("direction").setSFVec3f([dir_x, dir_y, dir_z])
+                    light_node.getField("direction").setSFVec3f([
+                        random.uniform(-1.0, 1.0),
+                        random.uniform(-1.0, -0.3),
+                        random.uniform(-1.0, 1.0),
+                    ])
+ 
+            fill_light = supervisor.getFromDef("FILL_LIGHT")
+            if fill_light:
+                fill_light.getField("intensity").setSFFloat(random.uniform(0.0, 2.0))
+                fill_light.getField("ambientIntensity").setSFFloat(random.uniform(0.0, 0.5))
+                fill_light.getField("color").setSFColor([
+                    random.uniform(0.6, 1.0),
+                    random.uniform(0.6, 1.0),
+                    random.uniform(0.6, 1.0),
+                ])
+                if fill_light.getTypeName() == "DirectionalLight":
+                    fill_light.getField("direction").setSFVec3f([
+                        random.uniform(-1.0, 1.0),
+                        random.uniform(-1.0, -0.1),
+                        random.uniform(-1.0, 1.0),
+                    ])
 
+            camera_defs = [
+                "realsense_color1", 
+                "realsense_color2", 
+                "realsense_range1", 
+                "realsense_range2"
+            ]
+            
+            for cam_def in camera_defs:
+                cam_node = supervisor.getFromDef(cam_def)
+                if cam_node:
+                    noise_level = random.uniform(0.0, 0.03)
+                    cam_node.getField("noise").setSFFloat(noise_level) 
+ 
         except Exception as e:
-            print(f"[DOMAIN RAND] Skipping randomization (error): {e}")
+            print(f"[DOMAIN RAND] Skipping randomization (nodes not found or error): {e}")
 
     def start_new_episode(self):
-        self.episode_count += 1
-        self.episode_active = True
+        self.episode_count  += 1
+        self.episode_active  = True
         self.curriculum.update(self.episode_count)
 
-        if not self.real_robot:
+        if not self.real_robot and self.robot_id == 1:
             self._randomize_domain()
 
+        if not self.real_robot:
+            self._randomize_camera_poses()
+
         self._spawn_object_at_curriculum_position()
-        self._send_message_to_host({'type': 'episode_start', 'episode': self.episode_count})
+        self._send_message_to_host({'type': 'episode_start',
+                                    'episode':  self.episode_count,
+                                    'robot_id': self.robot_id})
 
     def _spawn_object_at_curriculum_position(self):
+        robot_id   = self.robot_id
+        object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
         try:
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
 
-            obj_node = supervisor.getFromDef("TARGET_OBJECT")
+            obj_node = supervisor.getFromDef(object_def)
             if obj_node is None:
-                rospy.logwarn("[CURRICULUM] TARGET_OBJECT not found, skipping spawn.")
+                rospy.logwarn(f"[CURRICULUM R{robot_id}] {object_def} not found, skipping spawn.")
                 return
 
             if self.mode == 'inference' and self.inference_mode == 'free':
                 pos = obj_node.getPosition()
-                print(f"[INFERENCE/free] Object left at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+                print(f"[INFERENCE R{robot_id}/free] Object left at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
                 return
 
             if self.mode == 'inference' and self.inference_mode == 'cycle':
@@ -1051,53 +1534,55 @@ class SimulationClient:
             else:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
-            spawn_y = 0.461  
-            
+            spawn_y = 0.461
             position_field = obj_node.getField("translation")
             if position_field:
                 position_field.setSFVec3f([spawn_x, spawn_y, spawn_z])
-
             rotation_field = obj_node.getField("rotation")
             if rotation_field:
                 rotation_field.setSFRotation([0.0, 1.0, 0.0, 0.0])
-
             obj_node.resetPhysics()
 
         except Exception as e:
-            rospy.logerr(f"[CURRICULUM] Spawn error: {e}")
+            rospy.logerr(f"[CURRICULUM R{robot_id}] Spawn error: {e}")
 
     def _get_spawn_for_phase(self, phase_index: int) -> tuple:
+        """Returns bounds tailored exclusively to the curriculum configuration structure."""
         cfg = CurriculumManager.PHASE_CONFIG
         phase_index = max(0, min(phase_index, len(cfg) - 1))
         r_min, r_max, _, _, _ = cfg[phase_index]
-        cx = CurriculumManager.PLATFORM_CENTER_X
-        cz = CurriculumManager.PLATFORM_CENTER_Z
-        half_x = CurriculumManager.PLATFORM_HALF_SIZE_X
-        half_z = CurriculumManager.PLATFORM_HALF_SIZE_Z
+
+        cx     = self.curriculum.PLATFORM_CENTER_X
+        cz     = self.curriculum.PLATFORM_CENTER_Z
+        half_x = self.curriculum.PLATFORM_HALF_SIZE_X
+        half_z = self.curriculum.PLATFORM_HALF_SIZE_Z
 
         if r_max < 0.001:
-            print(f"[INFERENCE] Phase {phase_index} spawn: ({cx:.3f}, {cz:.3f}) | static centre")
+            print(f"[INFERENCE R{self.robot_id}] Phase {phase_index}: static centre ({cx:.3f}, {cz:.3f})")
             return (cx, cz)
 
-        angle = np.random.uniform(0, 2 * np.pi)
+        angle  = np.random.uniform(0, 2 * np.pi)
         radius = np.random.uniform(r_min, r_max)
         sx = np.clip(cx + radius * np.cos(angle), cx - half_x, cx + half_x)
         sz = np.clip(cz + radius * np.sin(angle), cz - half_z, cz + half_z)
-        print(f"[INFERENCE] Phase {phase_index} spawn: ({sx:.3f}, {sz:.3f}) | radius {radius*100:.1f}cm")
+        print(f"[INFERENCE R{self.robot_id}] Phase {phase_index} spawn: ({sx:.3f}, {sz:.3f}) | "
+              f"radius {radius*100:.1f}cm (max {r_max*100:.1f}cm)")
         return (sx, sz)
 
-    def end_current_episode(self, success):
+    def end_current_episode(self, success: bool):
         self.episode_active = False
-        mode = getattr(self, 'last_grasp_mode', 'explore')
+        mode     = getattr(self, 'last_grasp_mode', 'explore')
+        robot_id = self.robot_id
 
         if self.mode != 'inference':
             self.curriculum.record_result(success, mode)
             advanced = self.curriculum.check_phase_advance()
             if advanced:
-                print(f"[CURRICULUM] Phase advanced to {self.curriculum.phase}! Resetting epsilon.")
+                print(f"[CURRICULUM R{robot_id}] Phase advanced to {self.curriculum.phase}!")
                 self._send_message_to_host({
-                    'type':  'reset_epsilon',
-                    'value': 0.4
+                    'type':     'reset_epsilon',
+                    'value':    0.4,
+                    'robot_id': robot_id
                 })
 
         if self.mode == 'inference' and self.inference_mode == 'cycle':
@@ -1106,18 +1591,18 @@ class SimulationClient:
                 self._cycle_count_in_phase = 0
                 num_phases = len(CurriculumManager.PHASE_CONFIG)
                 self._cycle_phase = (self._cycle_phase + 1) % num_phases
-                print(f"[INFERENCE/cycle] Moving to Phase {self._cycle_phase} ({self.cycle_episodes_per_phase} episodes completed)")
+                print(f"[INFERENCE R{robot_id}/cycle] Moving to Phase {self._cycle_phase}")
 
-        status = "Success" if success else "Fail"
+        status = "✓" if success else "✗"
         if self.mode == 'inference':
-            print(f"[INFERENCE] {status} Episode {self.episode_count} complete")
+            print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} complete")
         else:
-            ai_rate = self.curriculum.get_ai_success_rate()
+            ai_rate     = self.curriculum.get_ai_success_rate()
             ai_attempts = len(self.curriculum.ai_recent_results)
-            ai_window = self.curriculum.PHASE_CONFIG[self.curriculum.phase][4]
-            print(f"[EPISODE] {status} Ep {self.episode_count} | Phase {self.curriculum.phase} | AI: {ai_rate*100:.1f}% ({ai_attempts}/{ai_window}) | Mode: {mode}")
-        
-        self._send_message_to_host({'type': 'episode_end', 'success': success})
+            ai_window   = self.curriculum.PHASE_CONFIG[self.curriculum.phase][4]
+            print(f"[EPISODE R{robot_id}] {status} Ep {self.episode_count} | "
+                  f"Phase {self.curriculum.phase} | "
+                  f"AI: {ai_rate*100:.1f}% ({ai_attempts}/{ai_window}) | Mode: {mode}")
 
     def run_simulation_loop(self, max_episodes: int = None):
         if not self.connect_to_host():
@@ -1126,52 +1611,72 @@ class SimulationClient:
         if not self.real_robot:
             self.robot_controller.home_position()
             time.sleep(2.0)
+            self._cache_camera_base_poses()
+            print(f"[BARRIER R{self.robot_id}] Waiting at startup barrier...")
+            response = self._send_message_to_host({
+                'type':     'episode_end',
+                'success':  False,
+                'robot_id': self.robot_id
+            })
+            print(f"[BARRIER R{self.robot_id}] Startup barrier cleared")
             self.start_new_episode()
         else:
-            rospy.loginfo('[REAL] Moving to home position before starting...')
+            rospy.loginfo(f'[REAL R{self.robot_id}] Moving to home position before starting...')
             home = self.robot_controller.get_home_joints(simulation=False)
             self._send_real_joints(home, duration=4.0)
             rospy.sleep(1.0)
             self._gripper_open()
-            rospy.loginfo('[REAL] Ready — waiting for GPU server predictions')
+            rospy.loginfo(f'[REAL R{self.robot_id}] At home — waiting at startup barrier...')
+            
+            startup_resp = self._send_message_to_host({
+                'type':     'episode_end',
+                'success':  False,
+                'robot_id': self.robot_id,
+            })
+            rospy.loginfo(f'[REAL R{self.robot_id}] Startup barrier cleared — ready for first cycle')
 
         if self.real_robot:
-            FLUSH_FRAMES = 10   
-            SETTLE_SLEEP = 1.0  
+            FLUSH_FRAMES   = 10   
+            SETTLE_SLEEP   = 1.0  
 
             while not rospy.is_shutdown():
                 if max_episodes is not None and self.episode_count > max_episodes:
-                    print(f"[CLIENT] Reached {max_episodes} episodes. Stopping.")
+                    print(f"[REAL R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
                     break
 
                 if not self.connected:
                     break
 
-                rospy.loginfo("[REAL] Flushing camera buffer before capture...")
-                for _ in range(FLUSH_FRAMES):
-                    self._capture_realsense()
-                rospy.sleep(SETTLE_SLEEP)
+                if self.ros_camera:
+                    rospy.loginfo(f"[REAL R{self.robot_id}] Settling after home move...")
+                    rospy.sleep(SETTLE_SLEEP)
+                    rgb, depth = self._capture_ros_camera()
+                else:
+                    rospy.loginfo(f"[REAL R{self.robot_id}] Flushing camera buffer before capture...")
+                    for _ in range(FLUSH_FRAMES):
+                        self._capture_realsense()
+                    rospy.sleep(SETTLE_SLEEP)
+                    rgb, depth = self._capture_realsense()
 
-                rgb, depth = self._capture_realsense()
                 if rgb is None:
-                    rospy.logwarn("[REAL] Camera returned None — retrying")
+                    rospy.logwarn(f"[REAL R{self.robot_id}] Camera returned None — retrying")
                     continue
-                self.latest_rgb_image = rgb
+                self.latest_rgb_image   = rgb
                 self.latest_depth_image = depth
 
-                rospy.loginfo("[REAL] Captured settled frame — sending to GPU server")
+                rospy.loginfo(f"[REAL R{self.robot_id}] Captured settled frame — sending to GPU server")
                 self._send_camera_data_to_host()
 
         else:
             rate = rospy.Rate(10)
             while not rospy.is_shutdown():
                 if max_episodes is not None and self.episode_count > max_episodes:
-                    print(f"[CLIENT] Reached {max_episodes} episodes. Stopping.")
+                    print(f"[CLIENT R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
                     break
 
                 self.webots_bridge.step()
                 self.camera_handler.update_from_webots()
-                self.latest_rgb_image = self.camera_handler.current_rgb_frame
+                self.latest_rgb_image   = self.camera_handler.current_rgb_frame
                 self.latest_depth_image = self.camera_handler.current_depth_frame
 
                 if self.latest_rgb_image is not None and self.connected:
@@ -1190,6 +1695,19 @@ def main():
                         help='Max episodes to run (training). Omit for infinite.')
     parser.add_argument('--real', action='store_true',
                         help='Run on real UR3e. Forces inference mode.')
+    parser.add_argument('--robot-id', type=int, default=1, choices=[1, 2],
+                        help='Which robot this process controls (1 or 2).\n'
+                             'Must match the WEBOTS_ROBOT_NAME environment variable:\n'
+                             '  Robot 1: export WEBOTS_ROBOT_NAME="ur3e_robot"\n'
+                             '  Robot 2: export WEBOTS_ROBOT_NAME="ur3e_robot2"\n'
+                             'Run two separate terminals, one per robot.')
+    parser.add_argument('--ros-camera', action='store_true',
+                        help='Use ROS image subscribers for the camera instead of\n'
+                             'opening the RealSense SDK directly.  Required on a\n'
+                             'Raspberry Pi where pyrealsense2 is not available, or\n'
+                             'when the camera is driven by a separate\n'
+                             '  roslaunch realsense2_camera rs_camera.launch\n'
+                             'process.  Implies --real.')
 
     inf_group = parser.add_argument_group(
         'Inference sub-modes',
@@ -1197,44 +1715,55 @@ def main():
         'Only one may be used at a time.'
     )
     inf_group.add_argument('--cycle', type=int, default=None, metavar='N',
-                           help='Cycle through all curriculum phases, N episodes per phase.')
+                           help='Cycle through all curriculum phases, N episodes per phase.\n'
+                                'Example: --mode inference --cycle 20')
     inf_group.add_argument('--free', action='store_true',
-                           help='No automatic spawning. Place the object manually.')
+                           help='No automatic spawning. Place the object manually.\n'
+                                'The AI will attempt a grasp wherever you put it.\n'
+                                'Example: --mode inference --free')
     inf_group.add_argument('--phase', type=int, default=None, metavar='N',
-                           help='Lock to a specific curriculum phase (0–4).')
+                           help='Lock to a specific curriculum phase (0–4).\n'
+                                'Object will always spawn with that phase\'s radius.\n'
+                                'Example: --mode inference --phase 2')
 
     args = parser.parse_args()
 
-    mode = 'inference' if args.real else args.mode
+    is_real = args.real or args.ros_camera
+    mode = 'inference' if is_real else args.mode
 
     inf_flags = [args.cycle is not None, args.free, args.phase is not None]
     if sum(inf_flags) > 1:
         parser.error("Only one of --cycle, --free, --phase may be used at a time.")
     if any(inf_flags) and mode != 'inference':
-        parser.error("--cycle / --free / --phase require --mode inference.")
+        parser.error("--cycle / --free / --phase require --mode inference (or --real / --ros-camera).")
 
-    client = SimulationClient(mode=mode, real_robot=args.real)
+    robot_id = args.robot_id
+    print(f"[STARTUP] Launching as Robot {robot_id}")
+
+    client = SimulationClient(mode=mode, real_robot=is_real, robot_id=robot_id,
+                              ros_camera=args.ros_camera)
 
     if mode == 'inference':
         if args.cycle is not None:
-            client.inference_mode = 'cycle'
+            client.inference_mode           = 'cycle'
             client.cycle_episodes_per_phase = args.cycle
             num_phases = len(CurriculumManager.PHASE_CONFIG)
-            print(f"[INFERENCE] Mode: CYCLE | {args.cycle} episodes x {num_phases} phases")
+            print(f"[INFERENCE R{robot_id}] Mode: CYCLE | {args.cycle} episodes × {num_phases} phases")
         elif args.free:
             client.inference_mode = 'free'
-            print("[INFERENCE] Mode: FREE | Place the object manually each episode")
+            print(f"[INFERENCE R{robot_id}] Mode: FREE | Place the object manually each episode")
         elif args.phase is not None:
             max_phase = len(CurriculumManager.PHASE_CONFIG) - 1
             if not 0 <= args.phase <= max_phase:
                 parser.error(f"--phase must be between 0 and {max_phase}.")
             client.inference_mode = 'phase'
-            client.fixed_phase = args.phase
+            client.fixed_phase    = args.phase
             cfg = CurriculumManager.PHASE_CONFIG[args.phase]
-            print(f"[INFERENCE] Mode: PHASE {args.phase} | radius {cfg[0]*100:.1f}-{cfg[1]*100:.1f}cm")
+            print(f"[INFERENCE R{robot_id}] Mode: PHASE {args.phase} | "
+                  f"radius {cfg[0]*100:.1f}–{cfg[1]*100:.1f}cm")
         else:
             client.inference_mode = 'normal'
-            print("[INFERENCE] Mode: NORMAL | Following curriculum as usual")
+            print(f"[INFERENCE R{robot_id}] Mode: NORMAL | Following curriculum as usual")
 
     client.run_simulation_loop(max_episodes=None if args.real else args.episodes)
 
