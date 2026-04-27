@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Enhanced Webots Bridge for UR3 System.
+Enhanced Webots Bridge for UR3e Hybrid System
 
-Provides an interface to the Webots simulation environment, handling
-initialization, device control, and state queries.
+Integrates the robotic control systems with the Webots simulation environment.
+Handles dynamic library path resolution, supervisor node management, and 
+simulated camera data extraction.
 """
 
 import os
@@ -13,6 +14,13 @@ import time
 import logging
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
+
+# =========================================================================
+# WEBOTS LIBRARY PATH DETECTION
+# =========================================================================
+# Automatically locates and prepends the Webots Python controller library 
+# to sys.path based on the current Python interpreter version.
+# =========================================================================
 
 WEBOTS_HOME = "/opt/webots"
 CONTROLLER_BASE = os.path.join(WEBOTS_HOME, "lib", "controller")
@@ -24,25 +32,24 @@ LIB_PATH = os.path.join(CONTROLLER_BASE, python_lib_folder)
 if os.path.exists(LIB_PATH):
     if LIB_PATH not in sys.path:
         sys.path.insert(0, LIB_PATH)
-        print(f"Found Webots Library for Python {py_ver}: {LIB_PATH}")
 else:
-    print(f"Auto-detected path {LIB_PATH} does not exist. Attempting fallbacks.")
     for ver in ["python38", "python39", "python36", "python37", "python27"]:
         fallback_path = os.path.join(CONTROLLER_BASE, ver)
         if os.path.exists(fallback_path):
             sys.path.insert(0, fallback_path)
-            print(f"Using fallback Webots path: {fallback_path}")
             break
 
 try:
     from controller import Supervisor, Robot
     from scipy.spatial.transform import Rotation as Rot
     WEBOTS_AVAILABLE = True
-    print("Webots Controller Module Imported Successfully.")
 except ImportError as e:
     WEBOTS_AVAILABLE = False
-    print(f"Webots controller unavailable: {e}")
-    print("Operating in mock mode.")
+    print(f"--> [FAIL] Webots controller not available: {e}. Using mock mode.")
+
+# =========================================================================
+# ROS & OPENCV DEPENDENCIES
+# =========================================================================
 
 try:
     import rospy
@@ -65,12 +72,22 @@ try:
 except ImportError:
     OPENCV_AVAILABLE = False
 
+
+# =========================================================================
+# WEBOTS SUPERVISOR
+# =========================================================================
+
 class WebotsSupervisor:
-    """Manages scene interactions via the Webots Supervisor API."""
+    """
+    Manages the global state of the Webots simulation.
+    Tracks blocks, the end-effector GPS, and handles simulation stepping and resets.
+    """
     def __init__(self, simulation: bool = True, world_file: str = "Environmentnewww.wbt", robot_instance=None):
         self.simulation = simulation
         self.logger = logging.getLogger('WebotsSupervisor')
+        
         self.supervisor = robot_instance
+        
         self.number_of_blocks = 5
         self.timestep = 16 
         self.ur3e_position = [0.69, 0.74, 0]
@@ -85,7 +102,7 @@ class WebotsSupervisor:
             self._setup_nodes() 
 
     def _setup_nodes(self):
-        """Initializes pointers to relevant scene nodes."""
+        """Binds block targets and GPS nodes to the supervisor instance."""
         self.ur3e_rotation = Rot.from_rotvec(-(np.pi / 2) * np.array([1.0, 0.0, 0.0]))
         self.blocks = []
         for i in range(self.number_of_blocks):
@@ -98,7 +115,7 @@ class WebotsSupervisor:
             self.supervisor = Supervisor()
             self.timestep = int(self.supervisor.getBasicTimeStep())
             self._setup_nodes()
-            self.logger.info("Webots supervisor initialized.")
+            self.logger.info("Webots supervisor initialized")
         except Exception as e:
             self.logger.error(f"Failed to init supervisor: {e}")
             self._init_mock_supervisor()
@@ -118,9 +135,10 @@ class WebotsSupervisor:
             }
             self.blocks.append(mock_block)
             
-        self.logger.info(f"Mock supervisor initialized with {len(self.blocks)} blocks.")
+        self.logger.info(f"Mock supervisor initialized with {len(self.blocks)} blocks")
         
     def _init_ros_services(self):
+        """Initializes ROS integration services for external control."""
         try:
             if not rospy.get_node_uri():
                 rospy.init_node('webots_supervisor', anonymous=True)
@@ -137,7 +155,7 @@ class WebotsSupervisor:
                 self._handle_position_request  
             )
             
-            self.logger.info("ROS services initialized.")
+            self.logger.info("ROS services initialized")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize ROS services: {e}")
@@ -145,11 +163,12 @@ class WebotsSupervisor:
     def step(self) -> bool:
         if self.supervisor:
             return self.supervisor.step(self.timestep) != -1
-        time.sleep(self.timestep / 1000.0)  
-        return True
+        else:
+            time.sleep(self.timestep / 1000.0) 
+            return True
             
     def get_block_poses(self) -> List[Dict[str, Any]]:
-        """Retrieves current position and orientation of target blocks."""
+        """Extracts world coordinate poses for all tracked scene blocks."""
         block_poses = []
         
         if self.supervisor and hasattr(self.supervisor, 'getFromDef'):
@@ -173,7 +192,7 @@ class WebotsSupervisor:
                     block_poses.append({
                         'id': i,
                         'position': block['position'],
-                        'rotation': block['rotation'] + [1, 0, 0, 0, 1, 0],  
+                        'rotation': block['rotation'] + [1, 0, 0, 0, 1, 0], 
                         'timestamp': time.time()
                     })
                     
@@ -181,9 +200,9 @@ class WebotsSupervisor:
         
     def set_block_pose(self, block_id: int, position: List[float], 
                       rotation: Optional[List[float]] = None) -> bool:
-        """Sets the position and rotation of a specified block node."""
+        """Teleports a specified block to a new position and orientation."""
         if block_id >= len(self.blocks):
-            self.logger.error(f"Block ID {block_id} out of range.")
+            self.logger.error(f"Block ID {block_id} out of range")
             return False
             
         if self.supervisor and hasattr(self.supervisor, 'getFromDef'):
@@ -192,7 +211,7 @@ class WebotsSupervisor:
                 try:
                     block.getField('translation').setSFVec3f(position)
                     if rotation:
-                        block.getField('rotation').setSFRotation(rotation + [1.0])  
+                        block.getField('rotation').setSFRotation(rotation + [1.0]) 
                     return True
                 except Exception as e:
                     self.logger.error(f"Failed to set block {block_id} pose: {e}")
@@ -207,7 +226,7 @@ class WebotsSupervisor:
         return False
         
     def get_robot_state(self) -> Dict[str, Any]:
-        """Collects the simulated robot state and end effector orientation."""
+        """Returns the current spatial state of the robot and end-effector."""
         robot_state = {
             'position': self.ur3e_position.copy(),
             'rotation': [0, 0, 0],
@@ -260,17 +279,46 @@ class WebotsSupervisor:
         return self.get_robot_state()
 
 
+# =========================================================================
+# WEBOTS CAMERA INTERFACE
+# =========================================================================
+
 class WebotsCamera:
-    """Manages virtual camera devices connected to the Webots simulation."""
+    """
+    Interfaces with Webots Camera nodes to extract and format RGB-D buffers.
+    Applies resolution downscaling and necessary rotational corrections depending
+    on the physical mounting orientation of the sensor in the simulation world.
+    """
+
     OUTPUT_WIDTH  = 640
     OUTPUT_HEIGHT = 360
 
-    def __init__(self, simulation: bool = True, robot_instance=None):
+    def __init__(self, simulation: bool = True, robot_instance=None,
+                 color_device_name: str = 'realsense_color',
+                 range_device_name: str = 'realsense_range',
+                 rot90_k: int = 3,
+                 flip_lr: bool = True):
+        """
+        Args:
+            simulation: Flag indicating if the environment is active.
+            robot_instance: Shared Webots Supervisor handle.
+            color_device_name: Node DEF name for the RGB camera.
+            range_device_name: Node DEF name for the Depth/Range camera.
+            rot90_k: Orientation correction integer (0=none, 1=90° CCW, 2=180°, 3=270° CCW).
+            flip_lr: Boolean flag to apply a left/right mirror correction.
+        """
         self.simulation = simulation
         self.logger = logging.getLogger('WebotsCamera')
-        self.robot = robot_instance 
-        
+        self.robot = robot_instance  
+
+        self.color_device_name = color_device_name
+        self.range_device_name = range_device_name
+
+        self.rot90_k = rot90_k
+        self.flip_lr = flip_lr
+
         self.timestep = 4
+        
         self.image_width  = 1280
         self.image_height = 720
 
@@ -280,15 +328,24 @@ class WebotsCamera:
             self._init_mock_camera()
 
     def _setup_devices(self):
-        self.camera = self.robot.getDevice('realsense_color')
-        self.depth_camera = self.robot.getDevice('realsense_range')
+        self.camera       = self.robot.getDevice(self.color_device_name)
+        self.depth_camera = self.robot.getDevice(self.range_device_name)
+        
         if self.camera:
             self.camera.enable(self.timestep)
-            self.image_width = self.camera.getWidth()
+            self.image_width  = self.camera.getWidth()
             self.image_height = self.camera.getHeight()
-            self.logger.info(f"Webots RGB camera native resolution: {self.image_width}x{self.image_height}")
+            self.logger.info(
+                f"Webots RGB camera '{self.color_device_name}' "
+                f"native resolution: {self.image_width}x{self.image_height}"
+            )
+        else:
+            self.logger.error(f"Camera device '{self.color_device_name}' not found in Webots scene!")
+            
         if self.depth_camera:
             self.depth_camera.enable(self.timestep)
+        else:
+            self.logger.error(f"Depth device '{self.range_device_name}' not found in Webots scene!")
 
     def _init_mock_camera(self):
         self.camera = None
@@ -314,7 +371,7 @@ class WebotsCamera:
                     self._handle_depth_request
                 )
                 
-                self.logger.info("Camera ROS services initialized.")
+                self.logger.info("Camera ROS services initialized")
                 
         except Exception as e:
             self.logger.error(f"Failed to initialize camera ROS services: {e}")
@@ -325,8 +382,10 @@ class WebotsCamera:
                 image_data = self.camera.getImageArray()
                 if image_data:
                     image = np.array(image_data, dtype=np.uint8)
-                    image = np.rot90(image, k=3)
-                    image = np.fliplr(image)  
+                    if self.rot90_k:
+                        image = np.rot90(image, k=self.rot90_k)
+                    if self.flip_lr:
+                        image = np.fliplr(image)
                     if OPENCV_AVAILABLE:
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     if image.shape[1] != self.OUTPUT_WIDTH or image.shape[0] != self.OUTPUT_HEIGHT:
@@ -343,8 +402,10 @@ class WebotsCamera:
                 depth_data = self.depth_camera.getRangeImageArray()
                 if depth_data:
                     depth = np.array(depth_data, dtype=np.float32)
-                    depth = np.rot90(depth, k=3)
-                    depth = np.fliplr(depth)  
+                    if self.rot90_k:
+                        depth = np.rot90(depth, k=self.rot90_k)
+                    if self.flip_lr:
+                        depth = np.fliplr(depth)
                     if depth.shape[1] != self.OUTPUT_WIDTH or depth.shape[0] != self.OUTPUT_HEIGHT:
                         depth = cv2.resize(depth, (self.OUTPUT_WIDTH, self.OUTPUT_HEIGHT),
                                            interpolation=cv2.INTER_LINEAR)
@@ -379,8 +440,16 @@ class WebotsCamera:
         return None
 
 
+# =========================================================================
+# CENTRAL INTEGRATION BRIDGE
+# =========================================================================
+
 class WebotsBridge:
-    """Primary entry point initializing and unifying Webots control structures."""
+    """
+    Main orchestration class that ties together the Supervisor and individual Camera
+    nodes. Supports dual-robot setups by mapping independent camera streams to a 
+    single shared supervisor backend.
+    """
     def __init__(self, simulation: bool = True, world_file: str = "Environmentnewww.wbt"):
         self.simulation = simulation
         self.logger = logging.getLogger('WebotsBridge')
@@ -394,11 +463,29 @@ class WebotsBridge:
                 self.logger.error(f"Could not create Supervisor: {e}")
 
         self.supervisor = WebotsSupervisor(simulation, world_file, robot_instance=self.shared_robot)
-        self.camera = WebotsCamera(simulation, robot_instance=self.shared_robot)
-        
+
+        self.camera = WebotsCamera(
+            simulation,
+            robot_instance=self.shared_robot,
+            color_device_name='realsense_color',
+            range_device_name='realsense_range',
+            rot90_k=3,
+            flip_lr=True
+        )
+
+        self.camera2 = WebotsCamera(
+            simulation,
+            robot_instance=self.shared_robot,
+            color_device_name='realsense_color2',
+            range_device_name='realsense_range2',
+            rot90_k=3,
+            flip_lr=True
+        )
+
         self.logger.info(f"Webots bridge initialized (simulation={simulation})")
 
     def step(self) -> bool:
+        """Step the simulation forward"""
         return self.supervisor.step()
  
     def get_block_poses(self) -> List[Dict[str, Any]]:
@@ -408,8 +495,108 @@ class WebotsBridge:
         return self.supervisor.get_robot_state()
         
     def capture_images(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Capture RGB and depth images from Robot 1's cameras."""
         return self.camera.capture_rgbd()
-        
+
+    def capture_images2(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Capture RGB and depth images from Robot 2's cameras."""
+        return self.camera2.capture_rgbd()
+
+    def get_camera(self, robot_id: int = 1) -> 'WebotsCamera':
+        """Return the WebotsCamera instance for the given robot_id (1 or 2)."""
+        return self.camera if robot_id == 1 else self.camera2
+
+    @staticmethod
+    def _signed_uniform(lo: float, hi: float) -> float:
+        """
+        Returns a value with magnitude [lo, hi] and a randomized sign.
+        Ensures perturbations never strictly center on the nominal zero pose.
+        """
+        return np.random.uniform(lo, hi) * np.random.choice([-1.0, 1.0])
+
+    def randomize_camera_pose(self,
+                              camera_defs: List[str],
+                              base_translations: List[List[float]],
+                              base_rotation_matrices: List[np.ndarray],
+                              xy_min: float = 0.005,
+                              xy_max: float = 0.020,
+                              z_min:  float = 0.005,
+                              z_max:  float = 0.010,
+                              angle_min_deg: float = 0.0,
+                              angle_max_deg: float = 0.5) -> bool:
+        """
+        Applies identically calculated spatial noise to a coupled set of cameras.
+        Crucial for maintaining RGB and Depth hardware alignment during domain randomization.
+
+        Args:
+            camera_defs: List of DEF names (e.g., ["realsense_color", "realsense_range"]).
+            base_translations: Nominal [x, y, z] anchors for the nodes.
+            base_rotation_matrices: Nominal 3x3 rotation anchors.
+            xy_min / xy_max: Bounds for X/Y planar noise (Meters).
+            z_min  / z_max: Bounds for Z elevation noise (Meters).
+            angle_min_deg / angle_max_deg: Bounds for Euler angular noise (Degrees).
+
+        Returns:
+            True if nodes were located and successfully translated.
+        """
+        if not self.shared_robot:
+            return False
+
+        nodes = []
+        for def_name in camera_defs:
+            node = self.shared_robot.getFromDef(def_name)
+            if node is None:
+                self.logger.warning(
+                    f"randomize_camera_pose: DEF '{def_name}' not found — "
+                    f"skipping entire group {camera_defs}"
+                )
+                return False
+            nodes.append(node)
+
+        try:
+            dx = self._signed_uniform(xy_min, xy_max)
+            dy = self._signed_uniform(xy_min, xy_max)
+            dz = self._signed_uniform(z_min,  z_max)
+
+            d_roll = d_pitch = d_yaw = 0.0
+            if WEBOTS_AVAILABLE:
+                angle_min_rad = np.deg2rad(angle_min_deg)
+                angle_max_rad = np.deg2rad(angle_max_deg)
+                d_roll  = self._signed_uniform(angle_min_rad, angle_max_rad)
+                d_pitch = self._signed_uniform(angle_min_rad, angle_max_rad)
+                d_yaw   = self._signed_uniform(angle_min_rad, angle_max_rad)
+                noise_rot = Rot.from_euler('xyz', [d_roll, d_pitch, d_yaw])
+
+            for node, base_t, base_r in zip(nodes, base_translations, base_rotation_matrices):
+                node.getField('translation').setSFVec3f([
+                    base_t[0] + dx,
+                    base_t[1] + dy,
+                    base_t[2] + dz,
+                ])
+
+                if WEBOTS_AVAILABLE:
+                    combined   = Rot.from_matrix(base_r) * noise_rot
+                    axis_angle = combined.as_rotvec()
+                    angle      = np.linalg.norm(axis_angle)
+                    if angle < 1e-9:
+                        axis  = [0.0, 1.0, 0.0]
+                        angle = 0.0
+                    else:
+                        axis = (axis_angle / angle).tolist()
+                    node.getField('rotation').setSFRotation(axis + [float(angle)])
+
+            self.logger.debug(
+                f"Camera group {camera_defs} nudged "
+                f"Δxyz=({dx*100:.2f},{dy*100:.2f},{dz*100:.2f}) cm  "
+                f"Δrpy=({np.rad2deg(d_roll):.2f},{np.rad2deg(d_pitch):.2f},"
+                f"{np.rad2deg(d_yaw):.2f})°"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"randomize_camera_pose failed for group {camera_defs}: {e}")
+            return False
+
     def reset_simulation(self) -> bool:
         return self.supervisor.reset_simulation()
         
@@ -420,7 +607,9 @@ class WebotsBridge:
 
 def create_webots_bridge(config: Optional[Dict[str, Any]] = None,
                         simulation: bool = True) -> WebotsBridge:
-    """Factory configuration function for initializing a WebotsBridge."""
+    """
+    Factory builder for deploying the Webots interconnect bridge.
+    """
     world_file = "Environmentnewww.wbt"
     if config and 'world_file' in config:
         world_file = config['world_file']

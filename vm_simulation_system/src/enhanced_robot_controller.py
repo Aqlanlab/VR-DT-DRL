@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Enhanced Robot Controller for UR3 System.
+Enhanced Robot Controller for UR3e System
 
-Integrates with Webots hardware bridge and provides robust motion planning.
-Handles coordinate mismatches between simulated and real environments,
-linear descent calculations, and maintains an optimal "tucked" posture.
+Provides kinematics, hardware bridging, and motion planning for the UR3e robotic arm.
+Supports execution in both Webots simulation and on physical hardware via ROS.
 """
 
 import numpy as np
@@ -17,6 +16,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from math import pi, sin, cos, acos, atan2, sqrt
 
+# --- Optional ROS Imports ---
 try:
     import rospy
     import actionlib
@@ -29,6 +29,7 @@ except ImportError:
     ROS_AVAILABLE = False
     print("ROS not available, operating in standalone Simulation mode.")
 
+# --- Optional Scipy Imports ---
 try:
     from scipy.spatial.transform import Rotation as Rot
     SCIPY_AVAILABLE = True
@@ -45,10 +46,17 @@ except ImportError:
 
 class UR3KinematicsController:
     """
-    Controller for Webots UR3 and Real Hardware.
+    Kinematics and motion controller for the UR3 arm.
+    Manages coordinate transformations, inverse kinematics (IK), and joint-space interpolation.
     """
 
-    # Shared "elbow-up" home poses configuration.
+    # =========================================================================
+    # HOME POSTURE CONFIGURATION
+    # =========================================================================
+    # Shared "elbow-up" home poses.
+    # SIM:  joint 0 = 0.0      (Base faces the platform in Webots)
+    # REAL: joint 0 = +pi/2    (Real base is physically rotated +90 deg relative to Webots)
+    # =========================================================================
     _HOME_JOINTS_SIM = [
         0.0,
         math.radians(-105.18),
@@ -59,17 +67,17 @@ class UR3KinematicsController:
     ]
     
     _HOME_JOINTS_REAL = [
-        math.pi / 2,
+        math.pi / 2,              
         math.radians(-105.18),
         math.radians( 102.93),
         math.radians( -87.75),
         math.radians( -90.05),
-        math.pi,
+        math.pi,                  
     ]
 
     @classmethod
     def get_home_joints(cls, simulation: bool = True) -> list:
-        """Returns the appropriate home joint angles for sim or real robot."""
+        """Returns the correct home joint angles for the active environment."""
         return list(cls._HOME_JOINTS_SIM if simulation else cls._HOME_JOINTS_REAL)
 
     HOME_JOINTS = _HOME_JOINTS_SIM
@@ -77,7 +85,8 @@ class UR3KinematicsController:
     def __init__(self, config_path: str = "config/robot_config.yaml", 
                  simulation: bool = True, 
                  robot_instance: Any = None,
-                 webots_bridge: Any = None):
+                 webots_bridge: Any = None,
+                 robot_id: int = 1):
                  
         self.logger = logging.getLogger('UR3Controller')
         handler = logging.StreamHandler(sys.stdout)
@@ -89,9 +98,11 @@ class UR3KinematicsController:
         self.is_sim = simulation
         self.webots_bridge = webots_bridge
         self.gripper: Optional['GripperController'] = None
+        self.robot_id = robot_id  
         
-        self.d = [0.1519, 0, 0, 0.11235, 0.08535, 0.0819]
-        self.a = [0, -0.24365, -0.21325, 0, 0, 0]
+        # UR3e DH parameters
+        self.d = [0.15185, 0, 0, 0.13105, 0.08535, 0.0921]
+        self.a = [0, -0.24355, -0.2132, 0, 0, 0]
         self.alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
 
         self.joints_state = [0.0] * 6
@@ -104,6 +115,7 @@ class UR3KinematicsController:
             self._setup_ros_interface()
 
     def _setup_webots_hardware(self, robot_instance):
+        """Binds Webots motor devices to the controller."""
         motor_names = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", 
                        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
         
@@ -117,6 +129,7 @@ class UR3KinematicsController:
                 self.logger.error(f"Motor {name} NOT FOUND!")
 
     def _setup_ros_interface(self):
+        """Initializes ROS subscribers for real-world state tracking."""
         self.joint_state_sub = rospy.Subscriber('/joint_states', JointState, self._joint_state_callback)
 
     def _joint_state_callback(self, msg):
@@ -124,7 +137,7 @@ class UR3KinematicsController:
             self.joints_state = list(msg.position[:6])
 
     def _wait_step(self, duration: float):
-        """Steps the simulation for a deterministic number of simulation intervals."""
+        """Deterministically steps the simulation for a specific duration."""
         if self.webots_bridge:
             n = max(1, int(duration * 80))
             for _ in range(n):
@@ -133,30 +146,40 @@ class UR3KinematicsController:
             time.sleep(duration)
 
     def _axis_angle_to_rotation(self, axis: np.ndarray, angle: float) -> np.ndarray:
+        """Converts an axis-angle representation into a 3x3 rotation matrix."""
         axis = axis / np.linalg.norm(axis)
         K = np.array([[0.0, -axis[2], axis[1]],
                       [axis[2], 0.0, -axis[0]],
                       [-axis[1], axis[0], 0.0]])
         return np.eye(3) + math.sin(angle) * K + (1 - math.cos(angle)) * (K @ K)
 
+
+    # =========================================================================
+    # COORDINATE TRANSFORMS
+    # =========================================================================
+
     def transform_webots_to_ur3(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
-        """Converts Webots world coordinates to UR3 base frame (Simulation)."""
+        """Converts Webots world coordinates to UR3 base frame (Robot 1 Simulation)."""
         base_pos_world = np.array([-0.685, 0.372, 0.47235])
+
         axis = np.array([-0.57735, -0.57735, -0.577351])
         angle = 2.0944
         R_wb = self._axis_angle_to_rotation(axis, angle)
 
         P_object_world = np.array([x, y, z])
         P_diff_world = P_object_world - base_pos_world
+
         P_local = R_wb.T @ P_diff_world
         return P_local[0], P_local[1], P_local[2]
 
     def transform_real_to_ur3(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
-        """Converts world coordinates to UR3 base frame for real hardware."""
+        """Converts world coordinates to UR3 base frame for the physical hardware."""
         base_pos_world = np.array([-0.685, 0.372, 0.47235])
+
         axis_wb = np.array([-0.57735, -0.57735, -0.577351])
         R_wb = self._axis_angle_to_rotation(axis_wb, 2.0944)
-        
+
+        # Apply -90 degree offset for physical base orientation
         R_Ym90 = self._axis_angle_to_rotation(np.array([0.0, 1.0, 0.0]), -math.pi / 2)
         R_real = R_Ym90 @ R_wb
 
@@ -164,24 +187,46 @@ class UR3KinematicsController:
         P_local = R_real.T @ P_diff
         return P_local[0], P_local[1], P_local[2]
 
+    def transform_webots_to_ur3_robot2(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
+        """Converts Webots world coordinates to UR3 base frame (Robot 2 Simulation)."""
+        base_pos_world = np.array([-1.226, 0.372, 0.47235])
+
+        axis  = np.array([-0.57735, -0.57735, -0.577351])
+        angle = 2.0944
+        R_wb  = self._axis_angle_to_rotation(axis, angle)
+
+        P_object_world = np.array([x, y, z])
+        P_diff_world   = P_object_world - base_pos_world
+        P_local        = R_wb.T @ P_diff_world
+        return P_local[0], P_local[1], P_local[2]
+
+
+    # =========================================================================
+    # INVERSE KINEMATICS (IK) SOLVER
+    # =========================================================================
+
     def _solve_ik_analytical(self, T_target: np.ndarray) -> List[List[float]]:
+        """Generates possible joint configurations for a target Cartesian pose."""
         solutions = []
         try:
+            # 1. Calculate Wrist Center (P_wc)
             P_tcp = T_target[0:3, 3]
-            Z_tool = T_target[0:3, 2]
+            Z_tool = T_target[0:3, 2]  
             
             d6 = self.d[5]
-            P_wc = P_tcp - d6 * Z_tool
+            P_wc = P_tcp - d6 * Z_tool 
 
+            # 2. Solve for Shoulder Pan (Theta 1)
             x_wc, y_wc = P_wc[0], P_wc[1]
             theta1 = atan2(y_wc, x_wc)
             
+            # 3. Solve 2D Planar Arm (Shoulder Lift & Elbow)
             d1 = self.d[0]
-            d5 = self.d[4]
-            r_wc = sqrt(x_wc**2 + y_wc**2) 
             d4 = self.d[3]
+            r_wc = sqrt(x_wc**2 + y_wc**2) 
+            
             if abs(r_wc) < d4: 
-                return []
+                return [] 
                 
             r_arm = sqrt(r_wc**2 - d4**2) 
             h_arm = P_wc[2] - d1
@@ -196,14 +241,17 @@ class UR3KinematicsController:
             cos_theta3 = (dist_s_w**2 - a2**2 - a3**2) / (2 * a2 * a3)
             cos_theta3 = max(-1.0, min(1.0, cos_theta3))
             
+            # Candidate 1: Elbow Down / Candidate 2: Elbow Up
             elbow_candidates = [-acos(cos_theta3), acos(cos_theta3)]
 
             for theta3 in elbow_candidates:
                 alpha = atan2(h_arm, r_arm)
                 beta = atan2(a3 * sin(theta3), a2 + a3 * cos(theta3))
-                theta2 = -(alpha + beta)
+                
+                theta2 = -(alpha + beta) 
 
                 yaw = atan2(T_target[1, 0], T_target[0, 0])
+                
                 theta4 = -(pi/2) - theta2 - theta3
                 theta5 = -pi/2 
                 theta6_raw = yaw - theta1
@@ -212,12 +260,17 @@ class UR3KinematicsController:
                 solutions.append([theta1, theta2, theta3, theta4, theta5, theta6])
 
             return solutions
-        except Exception:
+        except Exception as e:
             return []
+
+
+    # =========================================================================
+    # MOTION EXECUTION
+    # =========================================================================
 
     def move_linear_path(self, start_pose: List[float], end_pose: List[float], 
                      steps: int = 50, step_duration: float = 0.12) -> bool:
-        """Executes a linear movement path enforcing shoulder backward bias."""
+        """Executes a linear Cartesian path by interpolating waypoints."""
         p_start = np.array(start_pose[:3])
         p_end   = np.array(end_pose[:3])
         current_joints = np.array(self.joints_state)
@@ -229,6 +282,7 @@ class UR3KinematicsController:
         yaw = end_pose[3] if len(end_pose) > 3 else 0.0
         cy, sy = cos(yaw), sin(yaw)
         R_yaw = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        
         R_target = R_yaw @ R_down
 
         for i in range(1, steps + 1):
@@ -243,6 +297,7 @@ class UR3KinematicsController:
             
             if not solutions: return False
 
+            # Heuristic selection for optimal joint configuration
             best_sol = None
             min_score = float('inf')
             
@@ -272,6 +327,7 @@ class UR3KinematicsController:
         return True
 
     def move_to_joint_positions(self, target_joints, duration=3.0, wait=True):
+        """Commands synchronized joint-space movement."""
         if not self.motors: return False
     
         normalized = list(target_joints)
@@ -302,7 +358,7 @@ class UR3KinematicsController:
         return True
 
     def move_to_pose(self, target_pose: List[float], duration: float = 3.0, wait: bool = True) -> bool:
-        """Move the robot to a target Cartesian pose."""
+        """Solves IK for a specific Cartesian pose and executes the movement."""
         ik_x, ik_y, ik_z = target_pose[0], target_pose[1], target_pose[2]
         yaw = target_pose[3] if len(target_pose) > 3 else 0.0
 
@@ -329,14 +385,14 @@ class UR3KinematicsController:
             for sol in solutions:
                 sol_arr = np.array(sol)
                 joint_dist = np.linalg.norm(sol_arr - current_joints)
-                
+            
                 shoulder_val = sol[1]
                 penalty = 1000.0 if shoulder_val > -0.5 else 0.0
             
                 wrist3_delta = abs(sol[5] - self.joints_state[5])
                 if wrist3_delta > math.pi:
                     wrist3_delta = 2 * math.pi - wrist3_delta
-                wrist3_penalty = 50.0 * wrist3_delta
+                wrist3_penalty = 50.0 * wrist3_delta  
             
                 score = joint_dist + penalty + wrist3_penalty
                 if score < min_score:
@@ -345,12 +401,13 @@ class UR3KinematicsController:
         
             return self.move_to_joint_positions(best_sol, duration, wait)
     
+        print(f"[MoveToPose] No IK solution for {target_pose}")
         return False
 
     def move_joints_linear(self, target_joints: List[float], 
                         steps: int = 30, 
                         step_duration: float = 0.15) -> bool:
-        """Interpolates directly in joint space to prevent mid-motion IK snapping."""
+        """Interpolates directly in joint space using cosine easing."""
         if not self.motors:
             return False
 
@@ -375,48 +432,69 @@ class UR3KinematicsController:
         return True
 
     def home_position(self):
-        """Moves the arm to the standard elbow-up home position."""
+        """Returns the arm to the designated home configuration."""
         return self.move_to_joint_positions(
             self.get_home_joints(simulation=self.is_sim), duration=2.0)
 
+    # =========================================================================
+    # GRASP SEQUENCE EXECUTION
+    # =========================================================================
+
     def execute_grasp(self, pose: List[float]) -> bool:
-        """Executes a full grasp sequence (hover -> descend -> close -> lift)."""
+        """
+        Executes a complete pick sequence based on a 6-DOF Cartesian pose prediction.
+        Pose format: [x, y, z, rx, ry, rz]
+        """
         w_x, w_y, w_z = pose[0], pose[1], pose[2]
         yaw = pose[5] if len(pose) > 5 else (pose[3] if len(pose) > 3 else 0.0)
-        ik_x, ik_y, ik_z = self.transform_webots_to_ur3(w_x, w_y, w_z)
 
+        if self.robot_id == 2:
+            ik_x, ik_y, ik_z = self.transform_webots_to_ur3_robot2(w_x, w_y, w_z)
+        else:
+            ik_x, ik_y, ik_z = self.transform_webots_to_ur3(w_x, w_y, w_z)
+
+        # Apply kinematic reach limits
         r = math.sqrt(ik_x**2 + ik_y**2)
-        MAX_SAFE_RADIUS = 0.43
+        MAX_SAFE_RADIUS = 0.43   
         if r > MAX_SAFE_RADIUS:
             scale = MAX_SAFE_RADIUS / r
             ik_x *= scale
             ik_y *= scale
 
         target_z = ik_z
-        PLATFORM_Z = 0.068
-        FLOOR_MARGIN = 0.035
+
+        # ---------------------------------------------------------------------
+        # HEIGHT SETTINGS (Meters relative to robot base)
+        # ---------------------------------------------------------------------
+        PLATFORM_Z    = 0.068
+        FLOOR_MARGIN  = 0.035
         target_z = max(target_z, PLATFORM_Z + FLOOR_MARGIN)
 
         grasp_z  = target_z + 0.129
         hover_z  = grasp_z  + 0.11
         safe_z   = 0.40
+        # ---------------------------------------------------------------------
 
+        # Dynamic Compass Compensation (Maintains absolute world orientation)
         base_yaw_offset = 0.0
         try:
             sup = self.webots_bridge.supervisor
             if hasattr(sup, 'supervisor'):
                 sup = sup.supervisor
-            robot_node = sup.getFromDef("UR3")
+
+            robot_def = "UR3" if self.robot_id == 1 else "ur3_robot2"
+            robot_node = sup.getFromDef(robot_def)
             if robot_node:
                 rot_field = robot_node.getField("rotation").getSFRotation()
                 axis_y = rot_field[1] if len(rot_field) == 4 else 1.0
                 base_yaw_offset = rot_field[3] * np.sign(axis_y)
         except Exception as e:
-            self.logger.warning(f"Could not read dynamic base rotation: {e}")
+            print(f"Could not read dynamic base rotation: {e}")
 
         GRIPPER_MOUNT_OFFSET = math.pi / 4 - (math.pi / 16) + math.radians(11.2)
         ik_yaw = -(yaw - base_yaw_offset + GRIPPER_MOUNT_OFFSET)
 
+        # Initialize sequence
         if self.gripper:
             self.gripper.open_gripper()
             self._wait_step(0.8)
@@ -437,6 +515,7 @@ class UR3KinematicsController:
             solutions = self._solve_ik_analytical(T)
             if not solutions:
                 return None
+            
             current = np.array(self.joints_state)
             best, best_score = None, float('inf')
             for sol in solutions:
@@ -458,11 +537,13 @@ class UR3KinematicsController:
         joints_grasp = solve_waypoint(ik_x, ik_y, grasp_z)
 
         if not all([joints_safe, joints_hover, joints_grasp]):
-            self.logger.warning("Could not solve IK for one or more waypoints.")
+            print("[GRASP] Could not solve IK for one or more waypoints")
             return False
 
+        # Phase 1: Hover
         self.move_to_joint_positions(joints_hover, duration=1.0)
 
+        # Phase 2: Apply Compass Compensation to Wrist
         HOME_BASE_ANGLE  = 0.0
         HOME_WRIST_ANGLE = 3.0
         base_delta = joints_hover[0] - HOME_BASE_ANGLE
@@ -472,26 +553,29 @@ class UR3KinematicsController:
         joints_hover_compensated[5] = wrist_compensated
         self.move_to_joint_positions(joints_hover_compensated, duration=0.8)
 
+        # Phase 3: Vertical Descent
         N_STEPS = 15
         for i in range(1, N_STEPS + 1):
             t = i / float(N_STEPS)
             interp_z = hover_z + t * (grasp_z - hover_z)
             j = solve_waypoint(ik_x, ik_y, interp_z)
             if j is None:
-                self.logger.warning("IK failed during descent.")
+                print("[GRASP] IK failed during descent")
                 return False
             j = list(j)
             j[5] = wrist_compensated
             self.move_to_joint_positions(j, duration=0.05, wait=True)
         self._wait_step(0.2)
 
+        # Phase 4: Proximity Check
         try:
             closest = 9999.0
             if self.webots_bridge and hasattr(self.webots_bridge, 'supervisor'):
                 sup = self.webots_bridge.supervisor
                 if hasattr(sup, 'supervisor'):
                     sup = sup.supervisor
-                o_node = sup.getFromDef("TARGET_OBJECT")
+                target_def = "TARGET_OBJECT" if self.robot_id == 1 else "TARGET_OBJECT2"
+                o_node = sup.getFromDef(target_def)
                 g_node = sup.getFromDef("GRIPPER_MAIN")
                 if g_node is None: g_node = sup.getFromDef("UR3e")
                 if g_node is None: g_node = sup.getFromDef("UR3")
@@ -504,10 +588,12 @@ class UR3KinematicsController:
         except Exception:
             self._closest_approach_dist = 9999.0
 
+        # Phase 5: Actuate Gripper
         if self.gripper:
             self.gripper.close_gripper()
             self._wait_step(1.0)
 
+        # Phase 6: Retreat
         self.move_to_joint_positions(joints_hover, duration=1.0)
 
         return True
@@ -515,7 +601,8 @@ class UR3KinematicsController:
 
 class GripperController:
     """
-    Controller for the robotic gripper, managing both simulated and physical states.
+    Hardware interface for the end-effector.
+    Synchronizes state between Webots devices and ROS topics.
     """
     
     def __init__(self, robot_instance=None):
@@ -527,50 +614,65 @@ class GripperController:
             self.finger1 = robot_instance.getDevice("finger1")
             self.finger2 = robot_instance.getDevice("finger2")
             
+            # Safety Check: Verify devices initialized
             if self.finger1 and self.finger2:
+                # Velocity Control (Gentle Closing)
                 self.finger1.setVelocity(0.15) 
                 self.finger2.setVelocity(0.15)
+                
+                # Force Limit (Prevents object ejection)
                 self.finger1.setAvailableForce(10.0)
                 self.finger2.setAvailableForce(10.0)
             else:
-                logging.warning("Gripper fingers not found. Check device definitions.")
+                print("Warning: Gripper fingers not found! Check device names.")
 
         if ROS_AVAILABLE:
             self.gripper_pub = rospy.Publisher('/gripper/command', Bool, queue_size=1)
 
     def open_gripper(self, force: float = 50.0):
-        """Opens the gripper fingers."""
+        """Opens the gripper fingers fully."""
         self.is_closed = False
+        
         if self.finger1: self.finger1.setPosition(0.0)
         if self.finger2: self.finger2.setPosition(0.0)
+        
         if ROS_AVAILABLE:
             self.gripper_pub.publish(Bool(data=False))
 
     def close_gripper(self):
-        """Closes the gripper fingers."""
+        """Closes the gripper fingers to the designated threshold."""
         self.is_closed = True
-        if self.finger1: self.finger1.setPosition(0.024)
+        
+        # 0.024 represents closed state for the Hand-e gripper geometry
+        if self.finger1: self.finger1.setPosition(0.024) 
         if self.finger2: self.finger2.setPosition(0.024)
+        
         if ROS_AVAILABLE:
             self.gripper_pub.publish(Bool(data=True))
 
 
 class MotionPlanner:
-    """High-level motion planning and coordination abstraction."""
-    
+    """
+    High-level motion planning and coordination module.
+    """
     def __init__(self, robot_controller: UR3KinematicsController):
         self.robot = robot_controller
         self.logger = logging.getLogger('MotionPlanner')
 
     def plan_and_execute_grasp(self, pose: List[float]) -> bool:
-        """Executes the grasp sequence via the main robot controller."""
+        """Wrapper for triggering the robot's standardized grasp execution."""
         return self.robot.execute_grasp(pose)
 
 
 def create_robot_system(config_path: str = "config.yaml", 
                         simulation: bool = True, 
-                        webots_bridge: Any = None) -> Tuple[UR3KinematicsController, GripperController, MotionPlanner]:
-    """Factory function to initialize and link the controller, gripper, and planner."""
+                        webots_bridge: Any = None,
+                        robot_id: int = 1) -> Tuple[UR3KinematicsController, GripperController, MotionPlanner]:
+    """
+    Initializes a complete robot architecture instance.
+    robot_id=1 -> Base UR3
+    robot_id=2 -> Offset UR3
+    """
     robot_instance = None
     if webots_bridge:
         if hasattr(webots_bridge, 'supervisor'):
@@ -579,11 +681,20 @@ def create_robot_system(config_path: str = "config.yaml",
             else:
                 robot_instance = webots_bridge.supervisor
 
+    if robot_id == 2 and robot_instance is not None:
+        try:
+            robot2_node = robot_instance.getFromDef("ur3_robot2")
+            if robot2_node is not None:
+                robot_instance = robot2_node
+        except Exception as e:
+            print(f"[create_robot_system] Could not get ur3_robot2 node: {e}")
+
     robot_controller = UR3KinematicsController(
         config_path=config_path, 
         simulation=simulation, 
         robot_instance=robot_instance,
-        webots_bridge=webots_bridge
+        webots_bridge=webots_bridge,
+        robot_id=robot_id
     )
     
     gripper_controller = GripperController(robot_instance=robot_instance)
@@ -591,6 +702,18 @@ def create_robot_system(config_path: str = "config.yaml",
     motion_planner = MotionPlanner(robot_controller)
     
     return robot_controller, gripper_controller, motion_planner
+
+
+def create_dual_robot_system(config_path: str = "config.yaml",
+                              webots_bridge: Any = None):
+    """Initializes both standard and offset robot systems sharing a common bridge."""
+    ur3_r1, grip_r1, plan_r1 = create_robot_system(
+        config_path, simulation=True, webots_bridge=webots_bridge, robot_id=1
+    )
+    ur3_r2, grip_r2, plan_r2 = create_robot_system(
+        config_path, simulation=True, webots_bridge=webots_bridge, robot_id=2
+    )
+    return ur3_r1, grip_r1, plan_r1, ur3_r2, grip_r2, plan_r2
 
 
 if __name__ == "__main__":
@@ -601,8 +724,12 @@ if __name__ == "__main__":
         from webots_bridge import WebotsBridge
         bridge = WebotsBridge(simulation=True)
         
-        ur3, gripper, planner = create_robot_system("config.yaml", True, bridge)
-        print("Controller ready. Press Ctrl+C to exit.")
+        ur3_r1, gripper_r1, planner_r1, \
+        ur3_r2, gripper_r2, planner_r2 = create_dual_robot_system("config.yaml", bridge)
+
+        print("--> Dual Robot Controller Ready. Press Ctrl+C to exit.")
+        print("    Robot 1 (UR3):       base at x=-0.685, TARGET_OBJECT")
+        print("    Robot 2 (ur3_robot2): base at x=-1.226, TARGET_OBJECT2")
         
         rate = rospy.Rate(30) if ROS_AVAILABLE else None
         
