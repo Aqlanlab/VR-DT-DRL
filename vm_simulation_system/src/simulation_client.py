@@ -1419,7 +1419,16 @@ class SimulationClient:
                     node.getField("baseColor").setSFColor(
                         [random.random(), random.random(), random.random()]
                     )
- 
+                    
+            for support_def in ("BedSupports_1", "BedSupports_2"):
+                support_node = supervisor.getFromDef(support_def)
+                if support_node:
+                    shade = random.uniform(0.02, 0.25)
+                    support_node.getField("baseColor").setSFColor([shade, shade, shade])
+                   
+                    support_node.getField("roughness").setSFFloat(random.uniform(0.4, 0.85))
+                    support_node.getField("metalness").setSFFloat(random.uniform(0.7, 1.0))
+            
             self._apply_platform_texture(
                 supervisor,
                 tex_node_def  = "FLOOR_TEXTURE",
