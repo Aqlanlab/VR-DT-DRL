@@ -589,7 +589,7 @@ class SimulationClient:
 
         rospy.Subscriber(f'{ns}/color/image_raw', Image, self._ros_rgb_cb, queue_size=1, buff_size=2**24)
         rospy.Subscriber(f'{ns}/aligned_depth_to_color/image_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
-        rospy.Subscriber(f'{ns}/depth/image_rect_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
+        #rospy.Subscriber(f'{ns}/depth/image_rect_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
 
         rospy.loginfo(f"[ROS CAM R{self.robot_id}] Waiting for first frames on {ns}...")
         deadline = time.time() + 15.0
