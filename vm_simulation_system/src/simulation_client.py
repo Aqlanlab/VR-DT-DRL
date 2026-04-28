@@ -626,11 +626,12 @@ class SimulationClient:
         return frame
 
     def _ros_rgb_cb(self, msg):
+        """Store the latest RGB frame from the ROS topic."""
         try:
             enc = msg.encoding if msg.encoding else 'rgb8'
+            # _imgmsg_to_numpy already handles the RGB -> BGR conversion safely.
             frame = self._imgmsg_to_numpy(msg, enc)
-            if frame.ndim == 3 and frame.shape[2] == 3 and enc not in ('bgr8', '8UC3'):
-                frame = frame[:, :, ::-1].copy()  
+            
             with self._ros_cam_lock:
                 self._ros_rgb_frame = frame
                 if self._ros_depth_frame is not None:
