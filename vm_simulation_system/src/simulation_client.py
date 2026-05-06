@@ -22,14 +22,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque
 
-# RealSense dependencies (--real mode only)
+#  RealSense dependencies (--real mode only) 
 try:
     import pyrealsense2 as rs
     REALSENSE_AVAILABLE = True
 except ImportError:
     REALSENSE_AVAILABLE = False
 
-# Robotiq gripper dependencies (--real mode only)
+#  Robotiq gripper dependencies (--real mode only) 
 try:
     import roslib; roslib.load_manifest('robotiq_2f_gripper_control')
     from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_output as RobotiqOutput
@@ -38,7 +38,7 @@ try:
 except Exception:
     ROBOTIQ_AVAILABLE = False
 
-# Actionlib for real robot joint trajectory (--real mode only)
+#  Actionlib for real robot joint trajectory (--real mode only) 
 try:
     import actionlib
     from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
@@ -47,7 +47,7 @@ try:
 except ImportError:
     ACTIONLIB_AVAILABLE = False
 
-# ROS imports
+#  ROS imports 
 try:
     import rospy
     from sensor_msgs.msg import Image, JointState
@@ -107,9 +107,9 @@ class CurriculumManager:
     """
 
     PLATFORM_CENTER_X  = -0.646
-    PLATFORM_CENTER_Z  = 0.846
-    PLATFORM_HALF_SIZE_X = 0.145 
-    PLATFORM_HALF_SIZE_Z = 0.09  
+    PLATFORM_CENTER_Z  = 0.841
+    PLATFORM_HALF_SIZE_X = 0.143675 
+    PLATFORM_HALF_SIZE_Z = 0.083675  
 
     # =========================================================================
     # CURRICULUM PHASE CONFIGURATION
@@ -130,7 +130,7 @@ class CurriculumManager:
 
     def __init__(self, state_file="config/curriculum_state.json"):
         self.state_file = Path(state_file)
-        self.phase             = 4
+        self.phase             = 4  # Training permanently set to random spawn
         self.episodes_in_phase = 0
         self.episode           = 0
         self.ai_recent_results = deque(maxlen=50)
@@ -234,8 +234,8 @@ class CurriculumManager:
         cx = self.PLATFORM_CENTER_X
         cz = self.PLATFORM_CENTER_Z
         
-        half_x = 0.145   
-        half_z = 0.09  
+        half_x = 0.143675   
+        half_z = 0.083675  
 
         if self.phase == 4:
             # Full platform random distribution
@@ -483,9 +483,9 @@ class SimulationClient:
         # =========================================================================
         
         # --- Translation Offsets (Meters) ---
-        dx = signed(0.0, 0.020)
-        dy = signed(0.0, 0.020)
-        dz = signed(0.0, 0.010)
+        dx = signed(0.0, 0.015)
+        dy = signed(0.0, 0.015)
+        dz = signed(0.0, 0.008)
 
         # --- Rotation Offsets (Degrees) ---
         pitch_max_deg = 1.0   # Up/down tilt variance
@@ -528,9 +528,9 @@ class SimulationClient:
               f"Δyaw={np.rad2deg(d_yaw):.2f}°  "
               f"Δroll={np.rad2deg(d_roll):.2f}°")
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # HARDWARE INITIALIZATION & CONTROL (--real mode)
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _init_realsense(self):
         """Initializes direct PyRealSense2 hardware stream."""
@@ -589,8 +589,7 @@ class SimulationClient:
 
         rospy.Subscriber(f'{ns}/color/image_raw', Image, self._ros_rgb_cb, queue_size=1, buff_size=2**24)
         rospy.Subscriber(f'{ns}/aligned_depth_to_color/image_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
-        #rospy.Subscriber(f'{ns}/depth/image_rect_raw', Image, self._ros_depth_cb, queue_size=1, buff_size=2**24)
-
+        
         rospy.loginfo(f"[ROS CAM R{self.robot_id}] Waiting for first frames on {ns}...")
         deadline = time.time() + 15.0
         rate = rospy.Rate(10)
@@ -629,7 +628,6 @@ class SimulationClient:
         """Store the latest RGB frame from the ROS topic."""
         try:
             enc = msg.encoding if msg.encoding else 'rgb8'
-            # _imgmsg_to_numpy already handles the RGB -> BGR conversion safely.
             frame = self._imgmsg_to_numpy(msg, enc)
             
             with self._ros_cam_lock:
@@ -640,6 +638,7 @@ class SimulationClient:
             rospy.logwarn_throttle(5.0, f"[ROS CAM R{self.robot_id}] RGB decode error: {e}")
 
     def _ros_depth_cb(self, msg):
+        """Store the latest depth frame from the ROS topic."""
         try:
             enc = msg.encoding if msg.encoding else '16UC1'
             raw = self._imgmsg_to_numpy(msg, enc)
@@ -689,6 +688,7 @@ class SimulationClient:
         rospy.Subscriber(js_topic, JointState, self._real_joint_state_cb)
 
     def _real_joint_state_cb(self, msg):
+        """Synchronizes controller state with physical joint positions."""
         NAMES = ['shoulder_pan_joint','shoulder_lift_joint','elbow_joint',
                  'wrist_1_joint','wrist_2_joint','wrist_3_joint']
         positions = dict(zip(msg.name, msg.position))
@@ -791,11 +791,13 @@ class SimulationClient:
             self._gripper_ready = True
     
     def _gripper_status_cb(self, msg):
+        """Updates internal status based on physical gripper feedback."""
         self._gripper_status = msg
         if msg.gACT == 1 and msg.gSTA == 3:
             self._gripper_ready = True
 
     def _gripper_open(self):
+        """Sends open command to the physical Robotiq gripper."""
         if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
             return
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
@@ -804,6 +806,7 @@ class SimulationClient:
         rospy.sleep(1.0)
 
     def _gripper_close(self):
+        """Sends close command to the physical Robotiq gripper."""
         if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
             return
         cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
@@ -821,6 +824,7 @@ class SimulationClient:
         rospy.sleep(0.5)
 
     def _gripper_grasped(self) -> bool:
+        """Determines grasp success from physical gripper feedback."""
         if self._gripper_status is None:
             return False
         return self._gripper_status.gOBJ in (1, 2)
@@ -850,18 +854,21 @@ class SimulationClient:
         # Convert to UR3 Base Frame
         ik_x, ik_y, _ = self.robot_controller.transform_real_to_ur3(x, y, z)
 
-        # Hardcoded geometrical safety heights (Meters from base)
+        # =========================================================================
+        # REAL HARDWARE SAFETY LIMITS
+        # =========================================================================
         PLATFORM_Z   = 0.068   
         FLOOR_MARGIN = 0.050   
-        GRIPPER_OFF  = 0.129   
+        GRIPPER_OFF  = 0.115 # Gripper target height above platform
         HOVER_OFF    = 0.08    
 
         target_z = PLATFORM_Z + FLOOR_MARGIN        
         grasp_z  = target_z   + GRIPPER_OFF         
         hover_z  = grasp_z    + HOVER_OFF           
         safe_z   = hover_z    + 0.05                
-
+        
         WRIST_ANGLE = _m.pi   
+        # =========================================================================
 
         def _wrap(a):
             return min(abs(a), 2 * _m.pi - abs(a))
@@ -925,17 +932,15 @@ class SimulationClient:
             dist = np.linalg.norm(np.array(j_to) - np.array(j_from))
             return float(max(MIN_DURATION, dist / JOINT_SPEED))
 
-        cur = list(self.robot_controller.joints_state)
-
         rospy.loginfo("[REAL] Re-activating gripper...")
         self._gripper_reactivate()
         self._gripper_open()
 
-        # Step 1: Hover
+        # Step 1: Hover Phase
         rospy.loginfo("[REAL] → Hover")
         self._send_real_joints(j_hover, duration_for(j_safe, j_hover))
 
-        # Step 2: Wrist Compensation Matrix
+        # Step 2: Wrist Compensation Matrix Alignment
         HOME_BASE_ANGLE  = _m.pi / 2   
         HOME_WRIST_ANGLE = _m.pi       
         base_delta = j_hover[0] - HOME_BASE_ANGLE
@@ -945,14 +950,14 @@ class SimulationClient:
         j_hover_comp[5] = wrist_compensated
         self._send_real_joints(j_hover_comp, duration_for(j_hover, j_hover_comp))
 
-        # Step 3: Descend
+        # Step 3: Descend Phase
         j_grasp_comp = list(j_grasp)
         j_grasp_comp[5] = wrist_compensated
         rospy.loginfo("[REAL] → Descend")
         self._send_real_joints(j_grasp_comp, duration_for(j_hover_comp, j_grasp_comp))
         rospy.sleep(0.5)
 
-        # Step 4: Close Gripper
+        # Step 4: Actuate Gripper
         rospy.loginfo("[REAL] → Closing gripper")
         self._gripper_close()
         rospy.sleep(1.0)   
@@ -960,7 +965,7 @@ class SimulationClient:
         success = self._gripper_grasped()
         rospy.loginfo(f"[REAL] Grasp {'SUCCESS ✓' if success else 'FAIL ✗'}")
 
-        # Step 5: Retreat & Reset
+        # Step 5: Retreat & Reset Phase
         rospy.loginfo("[REAL] → Lift straight up")
         self._send_real_joints(j_safe, duration_for(j_grasp_comp, j_safe))
         
@@ -971,11 +976,12 @@ class SimulationClient:
         self._gripper_open()
         return success
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # GENERAL SIMULATION PIPELINES
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _load_config(self, config_path: str) -> Dict:
+        """Loads client configuration or returns default parameters."""
         try:
             with open(config_path, 'r') as f:
                 return yaml.safe_load(f)
@@ -983,6 +989,7 @@ class SimulationClient:
             return {'network': {'host_ip': '192.168.1.133', 'host_port': 8888}}
 
     def _setup_ros_interface(self):
+        """Binds ROS image and joint state topic subscribers."""
         self.rgb_sub         = rospy.Subscriber('/camera/image_raw', Image, self._rgb_callback)
         self.depth_sub       = rospy.Subscriber('/camera/depth/image_raw', Image, self._depth_callback)
         self.joint_state_sub = rospy.Subscriber('/ur3/joint_states', JointState, self._joint_state_callback)
@@ -1163,9 +1170,9 @@ class SimulationClient:
             target_z = ROBOT_BASE_Z + (final_dist * np.sin(angle_to_obj)) + (SHIFT_OFFSET * np.cos(angle_to_obj))
             target_y = d_pos[1] + HEIGHT_OFFSET
 
-            x = target_x + np.random.uniform(-0.005, 0.005) 
+            x = target_x + np.random.uniform(-0.005, 0.005)  #Teacher Grasp Variance for increased robustness (if object was in the same position the teach hover spot will change slightly)
             y = target_y  
-            z = target_z + np.random.uniform(-0.005, 0.005)
+            z = target_z + np.random.uniform(-0.005, 0.005)  #Teacher Grasp Variance for increased robustness
 
             yaw = angle_to_obj
 
@@ -1419,7 +1426,7 @@ class SimulationClient:
                     node.getField("baseColor").setSFColor(
                         [random.random(), random.random(), random.random()]
                     )
-                    
+
             for support_def in ("BedSupports_1", "BedSupports_2"):
                 support_node = supervisor.getFromDef(support_def)
                 if support_node:
@@ -1428,7 +1435,7 @@ class SimulationClient:
                    
                     support_node.getField("roughness").setSFFloat(random.uniform(0.4, 0.85))
                     support_node.getField("metalness").setSFFloat(random.uniform(0.7, 1.0))
-            
+ 
             self._apply_platform_texture(
                 supervisor,
                 tex_node_def  = "FLOOR_TEXTURE",
