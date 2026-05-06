@@ -1025,7 +1025,7 @@ class SimulationClient:
             if self.latest_rgb_image is None:
                 return
 
-            data_dir = Path("~/catkin_ws/src/vm_simulation_system/data").expanduser()
+            data_dir = Path("~/catkin_ws/src/vm_simulation_system/data").expanduser() #Saves image it took to your desktop
             data_dir.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(data_dir / f"latest_camera_view_r{self.robot_id}.jpg"),
                         self.latest_rgb_image)
