@@ -2,7 +2,9 @@
 """
 GPU Inference Server for UR3 Grasping System
 
-Manages neural network inference.
+Manages neural network inference, behavior cloning training buffers, and 
+multi-robot episode synchronization. Operates exclusively in Behavior Cloning 
+mode where training is driven by teacher demonstrations.
 """
 
 import torch
@@ -14,7 +16,6 @@ import json
 import threading
 import time
 import yaml
-import logging
 import base64
 import argparse
 from pathlib import Path
@@ -22,8 +23,6 @@ from typing import Dict, List, Tuple, Optional
 from collections import deque
 
 from enhanced_neural_network import UR3GraspCNN_Enhanced, BehaviorCloningModule, create_model, ImageProcessor
-from utils.logger import setup_logger
-from utils.metrics import PerformanceMonitor
 
 
 class GPUInferenceServer:
@@ -34,33 +33,41 @@ class GPUInferenceServer:
     def __init__(self, config_path: str = "config/network_config.yaml", model_path: str = None):
         self.config     = self._load_config(config_path)
         self.model_path = model_path
-        self.logger     = setup_logger("gpu_server", "data/logs/gpu_server.log")
 
         # =========================================================================
         # DEVICE & MODEL SETUP
         # =========================================================================
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         model_config = self._load_model_config()
-        self.model, self.bc_module, self.image_processor = create_model(model_config)
-        self.model          = self.model.to(self.device)
-        self.bc_module      = self.bc_module.to(self.device)
-        self.image_processor.device = self.device
+
+        # Robot 1 — Intel D455 (Wider FOV)
+        self.model,  self.bc_module,  self.image_processor  = create_model(model_config)
+        self.model       = self.model.to(self.device)
+        self.bc_module   = self.bc_module.to(self.device)
+
+        # Robot 2 — Intel D415 (Narrower FOV)
+        self.model2, self.bc_module2, self.image_processor2 = create_model(model_config)
+        self.model2      = self.model2.to(self.device)
+        self.bc_module2  = self.bc_module2.to(self.device)
 
         # =========================================================================
         # TRAINING BUFFER & SCHEDULING
         # =========================================================================
-        self.batch_size  = 16
-        self.data_buffer = deque(maxlen=10000)
-        self.training_step_count = 0
+        self.batch_size           = 16
+        self.data_buffer          = deque(maxlen=10000)   # Robot 1 Buffer
+        self.data_buffer2         = deque(maxlen=10000)   # Robot 2 Buffer
+        self.training_step_count  = 0
+        self.training_step_count2 = 0
 
         self._load_model_weights()
 
         self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.bc_module.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=50,
-            min_lr=1e-5
+            mode='min', factor=0.5, patience=50, min_lr=1e-5
+        )
+        self.lr_scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.bc_module2.optimizer,
+            mode='min', factor=0.5, patience=50, min_lr=1e-5
         )
 
         # =========================================================================
@@ -68,11 +75,24 @@ class GPUInferenceServer:
         # =========================================================================
         # Fractional crop boundaries (0.0-1.0) targeting the platform region.
         # R1 (Left Camera) and R2 (Right Camera) require asymmetric windows.
+        
+        # Robot 1: Left camera looking inward
         R1_CROP = dict(crop_y0=0.22, crop_y1=0.7, crop_x0=0.37,  crop_x1=0.60)
+
+        # Robot 2: Right camera looking inward
         R2_CROP = dict(crop_y0=0.21, crop_y1=0.885, crop_x0=0.37,  crop_x1=0.71)
 
-        self.image_processor  = ImageProcessor(self.device, **R1_CROP)
-        self.image_processor2 = ImageProcessor(self.device, **R2_CROP)
+        self.image_processor.crop_y0  = R1_CROP['crop_y0']
+        self.image_processor.crop_y1  = R1_CROP['crop_y1']
+        self.image_processor.crop_x0  = R1_CROP['crop_x0']
+        self.image_processor.crop_x1  = R1_CROP['crop_x1']
+        self.image_processor.device   = self.device
+
+        self.image_processor2.crop_y0 = R2_CROP['crop_y0']
+        self.image_processor2.crop_y1 = R2_CROP['crop_y1']
+        self.image_processor2.crop_x0 = R2_CROP['crop_x0']
+        self.image_processor2.crop_x1 = R2_CROP['crop_x1']
+        self.image_processor2.device  = self.device
 
         self._r1_crop = R1_CROP
         self._r2_crop = R2_CROP
@@ -96,15 +116,14 @@ class GPUInferenceServer:
         self._barrier_event       = threading.Event()
         self._barrier_lock        = threading.Lock()
 
-        self.performance_monitor = PerformanceMonitor()
-
         # =========================================================================
         # NETWORKING & CONCURRENCY
         # =========================================================================
-        self.is_running      = False
-        self.server_socket   = None
+        self.is_running         = False
+        self.server_socket      = None
         self.client_connections = []
-        self.train_lock = threading.Lock()
+        self.train_lock         = threading.Lock()
+        self.train_lock2        = threading.Lock()
 
     def _load_config(self, config_path: str) -> Dict:
         """Loads server network configuration."""
@@ -130,44 +149,49 @@ class GPUInferenceServer:
         """Locates and restores checkpoint weights, handling partial mismatches."""
         script_dir = Path(__file__).resolve().parent
 
-        if self.model_path:
-            path = Path(self.model_path)
-            if not path.is_absolute():
-                path = script_dir / path
-        else:
-            path = script_dir.parent / "models" / "ur3_live_model.pth"
-            if not path.exists():
-                path = script_dir.parent / "models" / "ur3_model.pth"
+        def _load(model, bc_module, path_override, default_name, step_attr):
+            if path_override:
+                path = Path(path_override)
+                if not path.is_absolute():
+                    path = script_dir / path
+            else:
+                path = script_dir.parent / "models" / default_name
+                if not path.exists():
+                    path = script_dir.parent / "models" / "ur3_model.pth"
 
-        print(f"🔍 Looking for weights at: {path.resolve()}")
+            print(f"🔍 Looking for weights at: {path.resolve()}")
+            if path.exists():
+                try:
+                    checkpoint  = torch.load(path, map_location=self.device)
+                    model_state = checkpoint.get('model_state_dict', checkpoint)
+                    
+                    missing, unexpected = model.load_state_dict(model_state, strict=False)
+                    if missing:
+                        print(f"   ↳ New keys (random init): {missing}")
+                    if unexpected:
+                        print(f"   ↳ Ignored old keys: {unexpected}")
+                        
+                    if 'optimizer_state_dict' in checkpoint:
+                        try:
+                            bc_module.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        except Exception as e:
+                            print(f"   ↳ Optimizer state not restored: {e}")
+                            
+                    step = checkpoint.get('training_step', 0)
+                    print(f"✅ Loaded weights: {path.resolve()}  (step {step})")
+                    return step
+                    
+                except Exception as e:
+                    print(f"⚠️  Failed to load checkpoint ({e}) — starting with RANDOM weights.")
+            else:
+                print(f"⚠️  No checkpoint found — starting with RANDOM weights.")
+                print(f"   ↳ Expected: {path.resolve()}")
+            return 0
 
-        if path.exists():
-            try:
-                checkpoint = torch.load(path, map_location=self.device)
-                model_state = checkpoint.get('model_state_dict', checkpoint)
-
-                missing, unexpected = self.model.load_state_dict(model_state, strict=False)
-                if missing:
-                    print(f"   ↳ New keys (random init): {missing}")
-                if unexpected:
-                    print(f"   ↳ Ignored old keys: {unexpected}")
-
-                if 'optimizer_state_dict' in checkpoint:
-                    try:
-                        self.bc_module.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    except Exception as e:
-                        print(f"   ↳ Optimizer state not restored: {e}")
-
-                self.training_step_count = checkpoint.get('training_step', 0)
-                print(f"✅ Loaded weights: {path.resolve()}")
-                print(f"   ↳ Resuming from step {self.training_step_count}")
-
-            except Exception as e:
-                print(f"⚠️  Failed to load checkpoint ({e}) — starting with RANDOM weights.")
-        else:
-            print(f"⚠️  No checkpoint found — starting with RANDOM weights.")
-            print(f"   ↳ Expected location: {path.resolve()}")
-
+        self.training_step_count  = _load(
+            self.model,  self.bc_module,  self.model_path,  "ur3_live_model_r1.pth", None)
+        self.training_step_count2 = _load(
+            self.model2, self.bc_module2, None,             "ur3_live_model_r2.pth", None)
 
     # =========================================================================
     # DATA PROCESSING UTILITIES
@@ -180,6 +204,7 @@ class GPUInferenceServer:
 
         rgb = cv2.imdecode(np.frombuffer(rgb_bytes, np.uint8), cv2.IMREAD_COLOR)
 
+        # Depth is encoded as: [H uint32 LE][W uint32 LE][H*W uint16 LE raw pixels]
         shape_header = np.frombuffer(depth_bytes[:8], dtype=np.uint32)
         h, w = int(shape_header[0]), int(shape_header[1])
         depth = np.frombuffer(depth_bytes[8:], dtype=np.uint16).reshape(h, w)
@@ -216,7 +241,11 @@ class GPUInferenceServer:
                 self.preprocess_rgbd_data(s_raw, is_simulation=is_sim, robot_id=robot_id)
             )
        
-            pose_labels_list.append(torch.tensor(a_raw, dtype=torch.float32))
+            local_pose = list(a_raw)
+            base_x = self._robot2_base_x if robot_id == 2 else self._robot1_base_x
+            local_pose[0] -= base_x
+            local_pose[2] -= self._robot_base_z
+            pose_labels_list.append(torch.tensor(local_pose, dtype=torch.float32))
 
             grasp_class = 1 if float(r_raw) >= 0.5 else 0
             grasp_labels_list.append(torch.tensor(grasp_class, dtype=torch.long))
@@ -268,18 +297,8 @@ class GPUInferenceServer:
         x1 = int(crop['crop_x1'] * w)
 
         processed = proc.process_rgbd_image(rgb, depth)
-
-        try:
-            suffix    = f"_r{robot_id}" + ("_sim" if is_simulation else "")
-            cv2.imwrite(f"ai_vision_debug_rgb{suffix}.jpg",   rgb[y0:y1, x0:x1].copy())
-            depth_crop = depth[y0:y1, x0:x1].copy()
-            depth_vis  = cv2.normalize(depth_crop, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            cv2.imwrite(f"ai_vision_debug_depth{suffix}.png", depth_vis)
-        except Exception:
-            pass
-
+        
         return processed
-
 
     # =========================================================================
     # MESSAGE HANDLERS & TRAINING LOGIC
@@ -308,11 +327,18 @@ class GPUInferenceServer:
                 camera_data, is_simulation=is_sim, robot_id=robot_id
             )
 
-            self.model.eval()
+            active_model = self.model2 if robot_id == 2 else self.model
+            active_model.eval()
             with torch.no_grad():
-                prediction = self.model(rgbd_tensor)
+                prediction = active_model(rgbd_tensor)
                 grasp_pose = prediction['pose_6dof'].cpu().numpy()[0]
 
+            # Convert local-frame prediction back to world coordinates
+            base_x = self._robot2_base_x if robot_id == 2 else self._robot1_base_x
+            grasp_pose[0] += base_x
+            grasp_pose[2] += self._robot_base_z
+
+            # Force tool-down orientation
             grasp_pose[3] = 3.14
             grasp_pose[4] = 0.0
 
@@ -352,40 +378,67 @@ class GPUInferenceServer:
                 except Exception as e:
                     print(f"[DEBUG R{robot_id}] Sim image save failed: {e}")
 
-            self.data_buffer.append({
+            sample = {
                 'state':      training_data['state'],
                 'action':     training_data['action'],
                 'reward':     training_data['reward'],
                 'object_pos': training_data.get('object_pos', [0.0, 0.0]),
                 'source':     source,
-                'robot_id':   robot_id,   
-            })
+                'robot_id':   robot_id,
+            }
 
-            if len(self.data_buffer) >= self.batch_size:
-                threading.Thread(target=self._run_training_step, daemon=True).start()
+            if robot_id == 2:
+                self.data_buffer2.append(sample)
+                if len(self.data_buffer2) >= self.batch_size:
+                    threading.Thread(
+                        target=self._run_training_step, args=(2,), daemon=True
+                    ).start()
+            else:
+                self.data_buffer.append(sample)
+                if len(self.data_buffer) >= self.batch_size:
+                    threading.Thread(
+                        target=self._run_training_step, args=(1,), daemon=True
+                    ).start()
 
             return {'type': 'training_ack', 'buffer_len': len(self.data_buffer)}
         except Exception as e:
             return {'type': 'error', 'message': str(e)}
 
-    def _run_training_step(self):
+    def _run_training_step(self, robot_id: int = 1):
         """Executes a single mini-batch gradient descent update asynchronously."""
-        if self.train_lock.locked():
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
             return
 
-        with self.train_lock:
+        with lock:
             try:
-                import random
-                batch_raw   = random.sample(list(self.data_buffer), self.batch_size)
+                import random, os
+                if robot_id == 2:
+                    bc_mod    = self.bc_module2
+                    model     = self.model2
+                    buf       = self.data_buffer2
+                    sched     = self.lr_scheduler2
+                    step_attr = 'training_step_count2'
+                    save_name = "ur3_live_model_r2.pth"
+                else:
+                    bc_mod    = self.bc_module
+                    model     = self.model
+                    buf       = self.data_buffer
+                    sched     = self.lr_scheduler
+                    step_attr = 'training_step_count'
+                    save_name = "ur3_live_model_r1.pth"
+
+                batch_raw   = random.sample(list(buf), self.batch_size)
                 torch_batch = self.format_batch_for_torch(batch_raw)
+                losses      = bc_mod.update_networks(torch_batch)
+                sched.step(losses['pose'])
+                
+                step = getattr(self, step_attr) + 1
+                setattr(self, step_attr, step)
 
-                losses = self.bc_module.update_networks(torch_batch)
-                self.lr_scheduler.step(losses['pose'])
-                self.training_step_count += 1
-
-                if self.training_step_count % 5 == 0:
+                if step % 5 == 0:
                     print(
-                        f"🔥 Step {self.training_step_count:4d} | "
+                        f"🔥 R{robot_id} Step {step:4d} | "
                         f"Loss: {losses['total']:.4f} "
                         f"(Pose:{losses['pose']:.4f} "
                         f"Aux:{losses['aux']:.4f} "
@@ -393,21 +446,21 @@ class GPUInferenceServer:
                         f"GradNorm: {losses['grad_norm']:.3f}"
                     )
 
-                if self.training_step_count % 100 == 0:
-                    import os
+                if step % 100 == 0:
                     base_dir  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                     save_dir  = os.path.join(base_dir, "models")
                     os.makedirs(save_dir, exist_ok=True)
-                    full_path = os.path.join(save_dir, "ur3_live_model.pth")
+                    full_path = os.path.join(save_dir, save_name)
+                    
                     torch.save({
-                        'model_state_dict':     self.model.state_dict(),
-                        'optimizer_state_dict': self.bc_module.optimizer.state_dict(),
-                        'training_step':        self.training_step_count
+                        'model_state_dict':     model.state_dict(),
+                        'optimizer_state_dict': bc_mod.optimizer.state_dict(),
+                        'training_step':        step,
                     }, full_path)
-                    print(f"💾 SAVED MODEL TO: {full_path}")
+                    print(f"💾 R{robot_id} SAVED MODEL TO: {full_path}")
 
             except Exception as e:
-                print(f"❌ CRITICAL TRAINING ERROR: {e}")
+                print(f"❌ CRITICAL TRAINING ERROR (R{robot_id}): {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -433,7 +486,6 @@ class GPUInferenceServer:
                 self._barrier_event.clear()
 
         return {'type': 'proceed'}
-
 
     # =========================================================================
     # NETWORKING ENGINE
@@ -485,11 +537,14 @@ class GPUInferenceServer:
         """Initializes the listener socket and spawns handler threads."""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
         host = self.config['network']['host_ip']
         port = self.config['network']['port']
+        
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
         print(f"🚀 BC Server listening on {host}:{port} (behavior cloning mode)")
+        
         while True:
             conn, addr = self.server_socket.accept()
             threading.Thread(
@@ -501,5 +556,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None)
     args   = parser.parse_args()
+    
     server = GPUInferenceServer(model_path=args.model)
     server.start_server()
